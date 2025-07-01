@@ -4,3 +4,4 @@ pymongo
 gtts
 pygame
 requests
+google-genai
