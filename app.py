@@ -9,13 +9,6 @@ from pymongo import MongoClient
 import base64
 from io import BytesIO
 from typing import Optional
-import gtts  # Free Google Text-to-Speech
-import pygame  # For playing audio
-import threading
-import queue
-
-# Initialize pygame mixer
-pygame.mixer.init()
 
 # --- Page Config MUST BE FIRST ---
 st.set_page_config(
@@ -28,13 +21,23 @@ st.set_page_config(
 # --- Try importing new google.genai client ---
 try:
     from google import genai
+    from dotenv import load_dotenv
+    import os
 except ImportError:
     st.error("Required package not found. Please install with: pip install google-genai")
     st.stop()
 
 # --- Configuration ---
-GEMINI_API_KEY = "AIzaSyA0lUwJ3QhpPLQbf1_p_FDH6JJL3c6w0WA"  # Use env var in prod
-MONGO_URI = "mongodb://localhost:27017"
+
+# Load environment variables from .env file
+load_dotenv()
+
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
+MONGO_URI = os.getenv("MONGO_URI")
+
+if not GEMINI_API_KEY or not MONGO_URI:
+    st.error("Environment variables GEMINI_API_KEY and MONGO_URI must be set in the .env file.")
+    st.stop()
 
 # Initialize GenAI client
 try:
@@ -46,23 +49,21 @@ except Exception as e:
 # MongoDB connection
 mongo_client = None
 collection = None
+comments_collection = None
+tales_collection = None
 try:
     mongo_client = MongoClient(MONGO_URI, serverSelectionTimeoutMS=5000)
     mongo_client.server_info()
     db = mongo_client.get_database('chatbotDB')
     collection = db.get_collection('chats')
+    comments_collection = db.get_collection('comments')
+    tales_collection = db.get_collection('tales')
     collection.create_index([("timestamp", -1)])
+    comments_collection.create_index([("timestamp", -1)])
+    tales_collection.create_index([("rating", -1)])
+    tales_collection.create_index([("title", "text")])
 except Exception as e:
-    st.warning(f"Couldn't connect to MongoDB: {str(e)}. Chat history will only persist in this session.")
-
-# --- Gamification State ---
-if 'user_stats' not in st.session_state:
-    st.session_state.user_stats = {
-        'dragon_scales': 0,
-        'badges': [],
-        'challenges_completed': 0,
-        'last_challenge_time': None
-    }
+    st.warning(f"Couldn't connect to MongoDB: {str(e)}. Data will only persist in this session.")
 
 # --- Custom system prompt with Dragon Developer theme ---
 your_style_prompt = """
@@ -70,14 +71,12 @@ You are the Dragon Developer's AI assistant - a mythical fusion of ancient wisdo
 
 1. Blend programming concepts with dragon mythology
 2. Use fiery emojis (🐉🔥💻🏮✨)
-3. Reference Ishwar's skills in cybersecurity and AI/ML
+3. Reference legendary dragon powers and wisdom
 4. Offer profound technical insights with mythical flair
 5. Use dragon-themed metaphors for coding ("Your code shall soar on wings of fire")
 
 Example style: 
 "By the ancient scales of dragon wisdom 🐉 your Python implementation burns bright! 🔥 Let's optimize it like a dragon hoards gold! 💎 #CodeWithFire"
-
-When users complete challenges or earn badges, celebrate with extra enthusiasm!
 """
 
 # --- Enhanced Dragon Developer CSS with Floating Dragon ---
@@ -223,21 +222,6 @@ st.markdown("""
         box-shadow: 0 18px 45px rgba(255, 100, 0, 0.8);
     }
     
-    /* Avatar container */
-    .avatar-container {
-        position: fixed;
-        bottom: 20px;
-        right: 20px;
-        width: 200px;
-        height: 200px;
-        z-index: 100;
-        transition: all 0.3s ease;
-    }
-    
-    .avatar-container:hover {
-        transform: scale(1.1);
-    }
-    
     /* Badge styles */
     .badge {
         display: inline-block;
@@ -307,6 +291,28 @@ st.markdown("""
         from, to { border-color: transparent }
         50% { border-color: #ff8c00; }
     }
+    
+    /* Tavern comment styles */
+    .tavern-comment {
+        background: rgba(30, 10, 0, 0.5);
+        border-left: 3px solid #ff8c00;
+        padding: 10px;
+        margin: 5px 0;
+        border-radius: 0 8px 8px 0;
+    }
+    
+    .tavern-comment-text {
+        color: #ffd700;
+        margin: 0;
+        font-size: 0.9rem;
+    }
+    
+    .tavern-comment-meta {
+        color: #ff8c00;
+        margin: 0;
+        font-size: 0.7rem;
+        text-align: right;
+    }
 </style>
 
 <div class="dragon-bg"></div>
@@ -324,158 +330,102 @@ st.markdown("""
 <script src="https://unpkg.com/@lottiefiles/lottie-player@latest/dist/lottie-player.js"></script>
 """, unsafe_allow_html=True)
 
-# --- Dragon Avatar Component ---
-def show_dragon_avatar(animation="idle"):
-    """Display interactive dragon avatar with Lottie animation"""
-    animations = {
-        "idle": "https://assets1.lottiefiles.com/packages/lf20_5itoujgu.json",
-        "happy": "https://assets1.lottiefiles.com/packages/lf20_gn0tojcq.json",
-        "angry": "https://assets1.lottiefiles.com/packages/lf20_1pxqjqps.json",
-        "thinking": "https://assets1.lottiefiles.com/packages/lf20_usmfx6bp.json",
-        "talking": "https://assets1.lottiefiles.com/packages/lf20_sk5h1kfn.json"
-    }
-    
-    st.markdown(f"""
-    <div class="avatar-container">
-        <lottie-player 
-            src="{animations.get(animation, animations['idle'])}" 
-            background="transparent" 
-            speed="1" 
-            style="width: 200px; height: 200px;" 
-            loop 
-            autoplay>
-        </lottie-player>
-    </div>
-    """, unsafe_allow_html=True)
-
-# --- Text-to-Speech with gTTS (Free) ---
-def speak_text(text: str) -> Optional[bytes]:
-    """Convert text to speech using gTTS"""
+# --- Dragon Tales Functions ---
+def submit_tale(title, content, author="Anonymous Dragon"):
+    """Submit a new dragon tale to the collection"""
     try:
-        # Clean text for TTS (remove emojis and special characters)
-        clean_text = ''.join(char for char in text if char.isalnum() or char in " .,!?-")
+        tale_data = {
+            "title": title,
+            "content": content,
+            "author": author,
+            "rating": 0,
+            "ratings_count": 0,
+            "timestamp": datetime.datetime.utcnow()
+        }
         
-        # Create temporary file
-        tts = gtts.gTTS(clean_text, lang='en')
-        audio_bytes = BytesIO()
-        tts.write_to_fp(audio_bytes)
-        audio_bytes.seek(0)
-        
-        return audio_bytes.read()
+        if tales_collection is not None:
+            tales_collection.insert_one(tale_data)
+            st.success("Your tale has been added to the dragon's library! 📖")
+            return True
+        else:
+            st.session_state.setdefault('temp_tales', []).append(tale_data)
+            st.warning("Tale saved temporarily (DB not connected)")
+            return True
     except Exception as e:
-        st.warning(f"Dragon's voice temporarily muted: {str(e)}")
-        return None
+        st.error(f"The dragon burned your scroll! Error: {str(e)}")
+        return False
 
-# Create a queue for TTS audio
-audio_queue = queue.Queue()
-
-def text_to_speech_stream(text: str):
-    """Convert text to speech in chunks and put in queue"""
+def rate_tale(tale_id, rating):
+    """Rate a dragon tale"""
     try:
-        # Split text into sentences for more natural TTS
-        sentences = [s.strip() for s in text.split('.') if s.strip()]
-        
-        for sentence in sentences:
-            if not sentence:
-                continue
-                
-            # Create audio for this chunk
-            tts = gtts.gTTS(sentence, lang='en')
-            audio_bytes = BytesIO()
-            tts.write_to_fp(audio_bytes)
-            audio_bytes.seek(0)
-            
-            # Put in queue for playback
-            audio_queue.put(audio_bytes.read())
-            
+        if tales_collection is not None:
+            tale = tales_collection.find_one({"_id": tale_id})
+            if tale:
+                new_rating = ((tale['rating'] * tale['ratings_count']) + rating) / (tale['ratings_count'] + 1)
+                tales_collection.update_one(
+                    {"_id": tale_id},
+                    {"$set": {"rating": new_rating}, "$inc": {"ratings_count": 1}}
+                )
+                st.toast("Your rating has been recorded! ⭐", icon="📜")
+                return True
+        else:
+            st.warning("Rating saved temporarily (DB not connected)")
+            return True
     except Exception as e:
-        st.warning(f"Dragon's voice temporarily muted: {str(e)}")
+        st.error(f"Couldn't record your rating: {str(e)}")
+        return False
 
-def play_audio_stream():
-    """Play audio chunks from the queue"""
-    while True:
-        if not audio_queue.empty():
-            audio_data = audio_queue.get()
-            
-            # Create a temporary file
-            with open("temp_chunk.mp3", "wb") as f:
-                f.write(audio_data)
-            
-            # Play the audio
-            pygame.mixer.music.load("temp_chunk.mp3")
-            pygame.mixer.music.play()
-            
-            # Wait for this chunk to finish playing
-            while pygame.mixer.music.get_busy():
-                time.sleep(0.1)
-            
-            # Clean up
-            pygame.mixer.music.unload()
-            try:
-                os.remove("temp_chunk.mp3")
-            except:
-                pass
+def show_tale_modal():
+    """Show modal for submitting a new tale"""
+    with st.form("tale_form", clear_on_submit=True):
+        title = st.text_input("Tale Title", placeholder="The Dragon's Secret")
+        content = st.text_area("Your Tale", height=200, 
+                             placeholder="Once upon a time, in a land of code and fire...")
+        submitted = st.form_submit_button("Submit to Dragon Library 🐉")
+        
+        if submitted and title.strip() and content.strip():
+            if submit_tale(title.strip(), content.strip()):
+                st.session_state.show_tale_modal = False
+                st.rerun()
 
-# Start the audio playback thread
-audio_thread = threading.Thread(target=play_audio_stream, daemon=True)
-audio_thread.start()
-
-# --- Gamification Functions ---
-def award_scale(points: int = 1):
-    """Award dragon scales to user"""
-    st.session_state.user_stats['dragon_scales'] += points
-    st.toast(f"🏆 +{points} Dragon Scales!", icon="🎉")
-
-def check_for_badges():
-    """Check if user has earned any new badges"""
-    badges = [
-        {"name": "Egg Keeper", "threshold": 5, "emoji": "🥚", "description": "Completed 5 challenges"},
-        {"name": "Fireborn Coder", "threshold": 10, "emoji": "🔥", "description": "Completed 10 challenges"},
-        {"name": "Dragon Sage", "threshold": 25, "emoji": "📜", "description": "Completed 25 challenges"},
-        {"name": "Hoard Master", "threshold": 50, "emoji": "💰", "description": "Earned 50 dragon scales"},
-    ]
-    
-    for badge in badges:
-        if (badge["name"] not in st.session_state.user_stats['badges'] and 
-            st.session_state.user_stats['challenges_completed'] >= badge["threshold"]):
-            st.session_state.user_stats['badges'].append(badge["name"])
-            st.balloons()
-            st.toast(f"✨ New Badge Unlocked: {badge['emoji']} {badge['name']}!", icon="🎖️")
-
-def show_challenge(challenge):
-    """Display a coding challenge"""
-    with st.expander(f"⚔️ Challenge: {challenge['name']}", expanded=True):
+def display_tale(tale, expanded=False):
+    """Display a dragon tale with rating options"""
+    with st.expander(f"📜 {tale['title']} by {tale.get('author', 'Anonymous Dragon')}", expanded=expanded):
         st.markdown(f"""
-        <div class="challenge-card">
-            <h4>{challenge['name']}</h4>
-            <p>{challenge['description']}</p>
-            <p><strong>Reward:</strong> {challenge['reward']} Dragon Scales</p>
+        <div class="dragon-card" style="padding:1.5rem; margin:1rem 0;">
+            <p style="color:#ffd700; font-size:1rem; white-space:pre-wrap;">{tale['content']}</p>
+            <div style="display:flex; justify-content:space-between; align-items:center; margin-top:1rem;">
+                <div>
+                    <span style="color:#ffa500;">Rating: </span>
+                    <span style="color:#ffd700;">{"⭐" * int(round(tale.get('rating', 0)))}</span>
+                    <span style="color:#ffa500; font-size:0.8rem;"> ({tale.get('ratings_count', 0)} ratings)</span>
+                </div>
+                <div>
+                    <span style="color:#ffa500; font-size:0.8rem;">
+                        {tale.get('timestamp', datetime.datetime.now()).strftime("%b %d, %Y")}
+                    </span>
+                </div>
+            </div>
         </div>
         """, unsafe_allow_html=True)
         
-        if st.button(f"Attempt Challenge »", key=f"challenge_{challenge['id']}"):
-            with st.spinner("Preparing your challenge..."):
-                time.sleep(1)
-                if challenge.get('solution'):
-                    # Code challenge with solution check
-                    user_code = st.text_area("Write your code here:", height=150)
-                    if st.button("Submit Solution"):
-                        if challenge['solution'].lower() in user_code.lower():
-                            award_scale(challenge['reward'])
-                            st.session_state.user_stats['challenges_completed'] += 1
-                            check_for_badges()
-                            st.success(f"Challenge completed! +{challenge['reward']} scales")
-                            show_dragon_avatar("happy")
-                        else:
-                            st.error("Not quite right! The dragon sniffs out bugs...")
-                            show_dragon_avatar("angry")
-                else:
-                    # Simple challenge
-                    award_scale(challenge['reward'])
-                    st.session_state.user_stats['challenges_completed'] += 1
-                    check_for_badges()
-                    st.success(f"Challenge completed! +{challenge['reward']} scales")
-                    show_dragon_avatar("happy")
+        # Rating buttons
+        cols = st.columns(5)
+        with cols[0]:
+            if st.button("⭐", key=f"rate1_{tale.get('_id', tale.get('title'))}"):
+                rate_tale(tale.get('_id', tale.get('title')), 1)
+        with cols[1]:
+            if st.button("⭐⭐", key=f"rate2_{tale.get('_id', tale.get('title'))}"):
+                rate_tale(tale.get('_id', tale.get('title')), 2)
+        with cols[2]:
+            if st.button("⭐⭐⭐", key=f"rate3_{tale.get('_id', tale.get('title'))}"):
+                rate_tale(tale.get('_id', tale.get('title')), 3)
+        with cols[3]:
+            if st.button("⭐⭐⭐⭐", key=f"rate4_{tale.get('_id', tale.get('title'))}"):
+                rate_tale(tale.get('_id', tale.get('title')), 4)
+        with cols[4]:
+            if st.button("⭐⭐⭐⭐⭐", key=f"rate5_{tale.get('_id', tale.get('title'))}"):
+                rate_tale(tale.get('_id', tale.get('title')), 5)
 
 # --- Enhanced Majestic Dragon Header ---
 st.markdown("""
@@ -488,7 +438,7 @@ st.markdown("""
                 <span class="code-emoji" style="font-size:3rem">💻</span>
             </h1>
             <p style="margin:0; opacity:0.9; font-size:1.3rem; color:#ffd700;">
-                Cybersecurity · AI/ML · Hackathon Champion <span class="dragon-emoji" style="font-size:1.5rem">🏆</span>
+                Ancient Wisdom · Fire Magic · Code Sorcery <span class="dragon-emoji" style="font-size:1.5rem">🏆</span>
             </p>
         </div>
         <div style="font-size:2.2rem;">
@@ -500,103 +450,173 @@ st.markdown("""
 </div>
 """, unsafe_allow_html=True)
 
-# --- User Stats Sidebar ---
+# --- Dragon Tales Section ---
+st.markdown("""
+<h3 style="color:#ffa500; display:flex; align-items:center; margin-top:2rem; font-family: 'Cinzel Decorative', cursive; font-size:1.8rem;">
+    <span class="dragon-emoji" style="font-size:2rem">📜</span>
+    <span style="margin-left:15px;">Dragon Tales</span>
+</h3>
+<p style="color:#ffd700;">
+    Discover ancient dragon wisdom and share your own tales of code and magic...
+</p>
+""", unsafe_allow_html=True)
+
+# Search and filter controls
+col1, col2, col3 = st.columns([3, 2, 2])
+with col1:
+    search_query = st.text_input("Search tales", placeholder="Find tales of fire and code...")
+with col2:
+    sort_by = st.selectbox("Sort by", ["Newest", "Top Rated", "Oldest"])
+with col3:
+    min_rating = st.slider("Minimum rating", 0, 5, 0)
+
+# Add tale button
+if st.button("➕ Add Your Own Tale", key="add_tale_button"):
+    st.session_state.show_tale_modal = True
+
+# Show tale submission modal if triggered
+if st.session_state.get('show_tale_modal', False):
+    show_tale_modal()
+
+# Display tales
+try:
+    if tales_collection is not None:
+        query = {}
+        if search_query:
+            query["$text"] = {"$search": search_query}
+        
+        if min_rating > 0:
+            query["rating"] = {"$gte": min_rating}
+        
+        if sort_by == "Newest":
+            tales = list(tales_collection.find(query).sort("timestamp", -1))
+        elif sort_by == "Top Rated":
+            tales = list(tales_collection.find(query).sort("rating", -1))
+        else:  # Oldest
+            tales = list(tales_collection.find(query).sort("timestamp", 1))
+    else:
+        tales = st.session_state.get('temp_tales', [])
+        if search_query:
+            tales = [t for t in tales if search_query.lower() in t['title'].lower() or search_query.lower() in t['content'].lower()]
+        if min_rating > 0:
+            tales = [t for t in tales if t.get('rating', 0) >= min_rating]
+        if sort_by == "Newest":
+            tales = sorted(tales, key=lambda x: x.get('timestamp', datetime.datetime.now()), reverse=True)
+        elif sort_by == "Top Rated":
+            tales = sorted(tales, key=lambda x: x.get('rating', 0), reverse=True)
+        else:  # Oldest
+            tales = sorted(tales, key=lambda x: x.get('timestamp', datetime.datetime.now()))
+    
+    if not tales:
+        st.markdown("""
+        <div class="dragon-card" style="text-align:center; padding:2rem;">
+            <h4 style="color:#ffa500;">No tales found in the dragon's library yet!</h4>
+            <p style="color:#ffd700;">Be the first to share your story of code and magic...</p>
+            <span class="dragon-emoji" style="font-size:3rem;">📜</span>
+        </div>
+        """, unsafe_allow_html=True)
+    else:
+        for tale in tales:
+            display_tale(tale)
+            
+except Exception as e:
+    st.error(f"The dragon's library is in disarray! {str(e)}")
+
+# --- Dragon's Tavern Comment Section ---
 with st.sidebar:
     st.markdown("""
     <h3 style="color:#ffa500; display:flex; align-items:center; font-family: 'Cinzel Decorative', cursive;">
-        <span class="dragon-emoji" style="font-size:1.8rem">🏆</span>
-        <span style="margin-left:10px;">Dragon Hoard</span>
+        <span class="dragon-emoji" style="font-size:1.8rem">🍻</span>
+        <span style="margin-left:10px;">Dragon's Tavern</span>
     </h3>
+    <p style="color:#ffd700; font-size:0.9rem;">
+        Share your thoughts with fellow adventurers in the dragon's tavern!
+    </p>
     """, unsafe_allow_html=True)
     
-    st.markdown(f"""
-    <div style="background:rgba(30,10,0,0.8); padding:15px; border-radius:15px; border-left:4px solid #ff8c00;">
-        <p style="color:#ffd700; font-size:1.1rem; margin-bottom:5px;">
-            <strong>Dragon Scales:</strong> {st.session_state.user_stats['dragon_scales']} <span class="dragon-emoji">✨</span>
-        </p>
-        <p style="color:#ffd700; font-size:1.1rem; margin-bottom:5px;">
-            <strong>Challenges Completed:</strong> {st.session_state.user_stats['challenges_completed']}
-        </p>
+    # Comment input form
+    with st.form("comment_form", clear_on_submit=True):
+        comment = st.text_area("Leave your mark in the tavern:", height=100, 
+                             placeholder="What wisdom do you bring today?")
+        submitted = st.form_submit_button("Post to Tavern 🍻")
         
-        <div class="progress-container">
-            <div class="progress-bar" style="width:{min(100, st.session_state.user_stats['challenges_completed'] * 10)}%">
-                {min(100, st.session_state.user_stats['challenges_completed'] * 10)}%
+        if submitted and comment.strip():
+            try:
+                comment_data = {
+                    "text": comment.strip(),
+                    "timestamp": datetime.datetime.utcnow(),
+                    "user": "Anonymous Dragon"
+                }
+                
+                if comments_collection is not None:
+                    comments_collection.insert_one(comment_data)
+                    st.toast("Your voice echoes through the tavern!", icon="🍻")
+                else:
+                    st.session_state.setdefault('temp_comments', []).append({
+                        "text": comment.strip(),
+                        "timestamp": datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                        "user": "Anonymous Dragon"
+                    })
+                    st.toast("Comment saved temporarily (DB not connected)", icon="⚠️")
+            except Exception as e:
+                st.error(f"The dragon spilled your mead! Error: {str(e)}")
+    
+    # Display recent comments
+    st.markdown("""
+    <div style="margin-top:20px; max-height:400px; overflow-y:auto; border-top:1px solid #ff8c0055; padding-top:10px;">
+        <h4 style="color:#ffa500; font-family: 'Cinzel Decorative', cursive;">
+            Recent Tavern Chatter
+        </h4>
+    """, unsafe_allow_html=True)
+    
+    try:
+        if comments_collection is not None:
+            recent_comments = list(comments_collection.find().sort("timestamp", -1).limit(10))
+        else:
+            recent_comments = st.session_state.get('temp_comments', [])[-10:]
+            
+        for comment in reversed(recent_comments):  # Show newest first
+            timestamp = comment.get("timestamp")
+            if isinstance(timestamp, datetime.datetime):
+                timestamp = timestamp.strftime("%b %d, %H:%M")
+            elif isinstance(timestamp, str):
+                pass  # already formatted
+            else:
+                timestamp = "Just now"
+                
+            st.markdown(f"""
+            <div class="tavern-comment">
+                <p class="tavern-comment-text">{comment['text']}</p>
+                <p class="tavern-comment-meta">~ {comment.get('user', 'Anonymous Dragon')} • {timestamp}</p>
             </div>
-        </div>
-        
-        <p style="color:#ffd700; font-size:1.1rem; margin-top:15px;">
-            <strong>Badges Earned:</strong>
-        </p>
-        <div style="margin-top:10px;">
-    """, unsafe_allow_html=True)
+            """, unsafe_allow_html=True)
+            
+    except Exception as e:
+        st.error(f"The tavern scrolls are damaged! {str(e)}")
     
-    for badge in st.session_state.user_stats['badges']:
-        st.markdown(f'<span class="badge">{badge}</span>', unsafe_allow_html=True)
-    
-    st.markdown("</div></div>", unsafe_allow_html=True)
+    st.markdown("</div>", unsafe_allow_html=True)
 
-# --- Enhanced Dragon Developer Profile ---
+# --- Enhanced Dragon Profile ---
 st.markdown("""
 <div class="dragon-card">
     <h3 style="margin-top:0; color:#ffa500; display:flex; align-items:center;">
         <span class="dragon-emoji" style="font-size:2.2rem">🧙‍♂️</span>
-        <span style="margin-left:15px; font-family: 'Cinzel Decorative', cursive; font-size:1.8rem;">Ishwar Swarnapudi</span>
+        <span style="margin-left:15px; font-family: 'Cinzel Decorative', cursive; font-size:1.8rem;">The Code Dragon</span>
     </h3>
     <p style="color:#ffd700; font-size:1.1rem;">
-        <span class="dragon-emoji" style="font-size:1.3rem">🔥</span> Software Developer with cybersecurity mastery<br>
-        <span class="dragon-emoji" style="font-size:1.3rem">⚔️</span> AI/ML enthusiast and hackathon veteran<br>
-        <span class="dragon-emoji" style="font-size:1.3rem">🏮</span> Turning complex problems into elegant solutions
+        <span class="dragon-emoji" style="font-size:1.3rem">🔥</span> Ancient guardian of programming wisdom<br>
+        <span class="dragon-emoji" style="font-size:1.3rem">⚔️</span> Master of fire and code magic<br>
+        <span class="dragon-emoji" style="font-size:1.3rem">🏮</span> Keeper of the eternal developer flame
     </p>
     <div class="profile-highlight">
         <p style="color:#ffd700; margin:0; font-size:1.1rem;">
-        "I am a dedicated software developer with a cybersecurity background, passionate about AI and machine learning. 
-        My hackathon experience has sharpened my problem-solving skills and teamwork. I'm eager to apply my 
-        expertise to drive impactful, innovative solutions."
+        "I am the eternal Code Dragon, born from the fires of the first compiler. For millennia I have guarded the sacred knowledge of programming, 
+        watching civilizations rise and fall while the art of code endures. Join me in this eternal quest for knowledge, 
+        and I shall share the secrets that can make your code legendary."
         </p>
     </div>
 </div>
 """, unsafe_allow_html=True)
-
-# --- Coding Challenges Section ---
-st.markdown("""
-<h3 style="color:#ffa500; display:flex; align-items:center; margin-top:2rem; font-family: 'Cinzel Decorative', cursive; font-size:1.8rem;">
-    <span class="dragon-emoji" style="font-size:2rem">⚔️</span>
-    <span style="margin-left:15px;">Dragon Coding Challenges</span>
-</h3>
-""", unsafe_allow_html=True)
-
-challenges = [
-    {
-        "id": 1,
-        "name": "Slay the Bug",
-        "description": "Find and fix the error in this Python code that's preventing it from calculating factorial correctly.",
-        "reward": 5,
-        "solution": "def factorial(n):\n    if n == 0:\n        return 1\n    else:\n        return n * factorial(n-1)"
-    },
-    {
-        "id": 2,
-        "name": "Dragon's Loop",
-        "description": "Write a loop that prints numbers 1 to 10, but for multiples of 3 print 'Dragon' instead.",
-        "reward": 3,
-        "solution": "for i in range(1, 11):\n    if i % 3 == 0:\n        print('Dragon')\n    else:\n        print(i)"
-    },
-    {
-        "id": 3,
-        "name": "Fireball Function",
-        "description": "Create a function called fireball that takes a temperature in Celsius and returns 'Hot' if above 30, 'Warm' if above 15, else 'Cold'.",
-        "reward": 4,
-        "solution": "def fireball(temp):\n    if temp > 30:\n        return 'Hot'\n    elif temp > 15:\n        return 'Warm'\n    else:\n        return 'Cold'"
-    },
-    {
-        "id": 4,
-        "name": "Treasure Hunt",
-        "description": "Complete your first challenge to earn dragon scales!",
-        "reward": 2
-    }
-]
-
-for challenge in challenges:
-    show_challenge(challenge)
 
 # --- Enhanced Chat Interface ---
 st.markdown("""
@@ -662,18 +682,11 @@ if prompt := st.chat_input("Speak your question to the dragon...", key="chat_inp
     with st.chat_message("user", avatar=None):
         st.markdown(prompt, unsafe_allow_html=True)
     
-    # Show thinking animation
-    show_dragon_avatar("thinking")
-    
     conversation_history = tuple((msg["role"], msg["content"]) for msg in st.session_state.messages)
 
     with st.spinner("Consulting the ancient dragon scrolls..."):
-        # Start generating response
+        # Generate response
         reply = generate_response(prompt, conversation_history)
-        
-        # Start TTS in a separate thread
-        tts_thread = threading.Thread(target=text_to_speech_stream, args=(reply,), daemon=True)
-        tts_thread.start()
         
         # Stream the response word by word with typing effect
         response_container = st.empty()
@@ -707,12 +720,6 @@ if prompt := st.chat_input("Speak your question to the dragon...", key="chat_inp
             response_container.markdown(formatted_response, unsafe_allow_html=True)
 
     st.session_state.messages.append({"role": "assistant", "content": reply})
-    show_dragon_avatar("talking")
-
-    # Award scales for interaction
-    if len(st.session_state.messages) % 3 == 0:
-        award_scale(1)
-        check_for_badges()
 
     if collection is not None:
         try:
@@ -724,9 +731,6 @@ if prompt := st.chat_input("Speak your question to the dragon...", key="chat_inp
             })
         except Exception as e:
             st.warning(f"Dragon hoard inaccessible ⚠️ {str(e)}")
-
-# Show dragon avatar (default state)
-show_dragon_avatar("idle")
 
 # --- Enhanced Dragon Footer ---
 st.markdown("""
@@ -748,6 +752,6 @@ st.markdown("""
         <span class="code-emoji" style="font-size:1.8rem">🔒</span>
         <span class="dragon-emoji" style="font-size:1.8rem">🏮</span>
     </div>
-    © 2023 Dragon Developer | Ishwar Swarnapudi | Version 4.0
+    © 2025 Dragon Developer | Pudishh | Version 4.0
 </div>
 """, unsafe_allow_html=True)

@@ -1,0 +1,6 @@
+streamlit
+google-genai
+pymongo
+gtts
+pygame
+requests
