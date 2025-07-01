@@ -20,7 +20,7 @@ st.set_page_config(
 
 # --- Try importing new google.genai client ---
 try:
-    from google import genai
+    import google.generativeai as genai
     from dotenv import load_dotenv
     import os
 except ImportError:
