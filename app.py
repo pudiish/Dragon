@@ -40,6 +40,7 @@ if not GEMINI_API_KEY or not MONGO_URI:
     st.stop()
 
 # Initialize GenAI client
+genai.configure(api_key=GEMINI_API_KEY)
 try:
     genai.configure(api_key=GEMINI_API_KEY)
 except Exception as e:
