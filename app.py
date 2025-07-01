@@ -41,7 +41,7 @@ if not GEMINI_API_KEY or not MONGO_URI:
 
 # Initialize GenAI client
 try:
-    client = genai.Client(api_key=GEMINI_API_KEY)
+    genai.configure(api_key=GEMINI_API_KEY)
 except Exception as e:
     st.error(f"Failed to initialize Gemini Client: {str(e)}")
     st.stop()
@@ -644,8 +644,10 @@ for msg in st.session_state.messages:
 # Rate limiting variables
 LAST_REQUEST_TIME = 0
 MIN_REQUEST_INTERVAL = 1.2  # seconds
+from google.generativeai import GenerativeModel
 
 @lru_cache(maxsize=100)
+
 def generate_response(prompt: str, conversation_history: tuple):
     global LAST_REQUEST_TIME
 
@@ -656,24 +658,28 @@ def generate_response(prompt: str, conversation_history: tuple):
 
     retries = 3
     backoff = 1
+
+    # Initialize model (you can do this once globally if needed)
+    model = GenerativeModel("gemini-2.0-flash")
+
     for _ in range(retries):
         try:
             full_prompt = f"{your_style_prompt}\n\nCurrent conversation:\n"
             for role, content in conversation_history:
                 full_prompt += f"{role}: {content}\n"
             full_prompt += f"assistant: "
-            
-            response = client.models.generate_content(
-                model="gemini-2.0-flash",
-                contents=[full_prompt]
-            )
+
+            # Gemini expects content as a string or list of parts
+            response = model.generate_content(full_prompt)
             return response.text
+        
         except Exception as e:
             if "RATE_LIMIT_EXCEEDED" in str(e):
                 time.sleep(backoff)
                 backoff *= 2
             else:
                 return f"Dragon fire temporarily dimmed ⚡ Error: {str(e)} 🔥 Please try again when the flames reignite"
+    
     return "The dragon's breath is too hot 🚦 Wait 2 minutes before approaching again ✨"
 
 # Chat input
