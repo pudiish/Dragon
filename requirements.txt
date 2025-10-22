@@ -1,6 +1,15 @@
-streamlit
-google-generativeai
-pymongo
-gtts
-pygame
-requests
+streamlit>=1.39.0
+google-generativeai>=0.8.3
+pymongo>=4.10.1
+gtts>=2.5.1
+pygame>=2.6.1
+requests>=2.32.3
+python-dotenv>=1.0.1
+watchdog>=6.0.0
+# Optimized RAG Dependencies
+sentence-transformers>=2.2.2
+chromadb>=0.4.22
+asyncio
+concurrent.futures
+threading
+queue

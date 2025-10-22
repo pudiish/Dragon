@@ -9,6 +9,11 @@ from pymongo import MongoClient
 import base64
 from io import BytesIO
 from typing import Optional
+import threading
+import queue
+import asyncio
+from concurrent.futures import ThreadPoolExecutor, as_completed
+import gc
 
 # --- Page Config MUST BE FIRST ---
 st.set_page_config(
@@ -35,36 +40,244 @@ load_dotenv()
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 MONGO_URI = os.getenv("MONGO_URI")
 
-if not GEMINI_API_KEY or not MONGO_URI:
-    st.error("Environment variables GEMINI_API_KEY and MONGO_URI must be set in the .env file.")
-    st.stop()
+# Initialize services with error handling
+gemini_available = False
+mongo_available = False
+rag_available = False
 
-# Initialize GenAI client
-genai.configure(api_key=GEMINI_API_KEY)
-try:
-    genai.configure(api_key=GEMINI_API_KEY)
-except Exception as e:
-    st.error(f"Failed to initialize Gemini Client: {str(e)}")
-    st.stop()
+# Try to initialize GenAI client
+if GEMINI_API_KEY:
+    try:
+        genai.configure(api_key=GEMINI_API_KEY)
+        gemini_available = True
+    except Exception as e:
+        st.warning(f"Gemini API not available: {str(e)}")
+else:
+    st.warning("GEMINI_API_KEY not found. AI features will be limited.")
+
+# --- Optimized RAG System with Concurrent Processing ---
+class OptimizedRAGSystem:
+    def __init__(self):
+        self.embedding_model = None
+        self.chroma_client = None
+        self.knowledge_collection = None
+        self.executor = ThreadPoolExecutor(max_workers=2)
+        self.embedding_cache = {}
+        self.search_queue = queue.Queue()
+        self.result_cache = {}
+        self.initialized = False
+        
+    def initialize(self):
+        """Initialize RAG system with optimized settings"""
+        try:
+            # Lazy loading of heavy dependencies
+            from sentence_transformers import SentenceTransformer
+            import chromadb
+            from chromadb.config import Settings
+            
+            # Initialize embedding model with memory optimization
+            self.embedding_model = SentenceTransformer(
+                'all-MiniLM-L6-v2',
+                device='cpu',  # Use CPU for better memory management
+                cache_folder='./model_cache'
+            )
+            
+            # Initialize ChromaDB with optimized settings
+            self.chroma_client = chromadb.PersistentClient(
+                path="./chroma_db",
+                settings=Settings(
+                    anonymized_telemetry=False,
+                    allow_reset=True
+                )
+            )
+            
+            # Get or create collection with optimized settings
+            try:
+                self.knowledge_collection = self.chroma_client.get_collection("dragon_knowledge")
+            except:
+                self.knowledge_collection = self.chroma_client.create_collection(
+                    name="dragon_knowledge",
+                    metadata={"description": "Dragon Developer Knowledge Base"},
+                    embedding_function=None  # Use default embedding
+                )
+            
+            self.initialized = True
+            return True
+        except Exception as e:
+            st.warning(f"RAG system initialization failed: {str(e)}")
+            return False
+    
+    def add_document_async(self, text, metadata=None):
+        """Add document to knowledge base asynchronously"""
+        if not self.initialized:
+            return False, "RAG system not initialized"
+        
+        def _add_document():
+            try:
+                # Generate embedding
+                embedding = self.embedding_model.encode(text).tolist()
+                
+                # Create unique ID
+                doc_id = f"doc_{int(time.time() * 1000)}"
+                
+                # Add to collection
+                self.knowledge_collection.add(
+                    embeddings=[embedding],
+                    documents=[text],
+                    metadatas=[metadata or {}],
+                    ids=[doc_id]
+                )
+                
+                return True, f"Document added with ID: {doc_id}"
+            except Exception as e:
+                return False, f"Error adding document: {str(e)}"
+        
+        # Submit to thread pool
+        future = self.executor.submit(_add_document)
+        return future
+    
+    def search_knowledge_async(self, query, n_results=3):
+        """Search knowledge base asynchronously"""
+        if not self.initialized:
+            return None, "RAG system not initialized"
+        
+        # Check cache first
+        cache_key = f"{query}_{n_results}"
+        if cache_key in self.result_cache:
+            return self.result_cache[cache_key]
+        
+        def _search_knowledge():
+            try:
+                # Generate query embedding
+                query_embedding = self.embedding_model.encode(query).tolist()
+                
+                # Search collection
+                results = self.knowledge_collection.query(
+                    query_embeddings=[query_embedding],
+                    n_results=n_results
+                )
+                
+                # Format results
+                documents = []
+                for i in range(len(results['documents'][0])):
+                    documents.append({
+                        'text': results['documents'][0][i],
+                        'metadata': results['metadatas'][0][i],
+                        'distance': results['distances'][0][i]
+                    })
+                
+                # Cache results
+                self.result_cache[cache_key] = (documents, "Search completed successfully")
+                return documents, "Search completed successfully"
+            except Exception as e:
+                return [], f"Error searching knowledge base: {str(e)}"
+        
+        # Submit to thread pool
+        future = self.executor.submit(_search_knowledge)
+        return future
+    
+    def get_rag_context_async(self, query):
+        """Get RAG context asynchronously with caching"""
+        if not self.initialized:
+            return ""
+        
+        # Check cache first
+        if query in self.embedding_cache:
+            return self.embedding_cache[query]
+        
+        def _get_context():
+            try:
+                future = self.search_knowledge_async(query, n_results=3)
+                documents, _ = future.result(timeout=5)  # 5 second timeout
+                
+                if not documents:
+                    return ""
+                
+                # Format context
+                context = "Relevant knowledge from the dragon's library:\n\n"
+                for i, doc in enumerate(documents, 1):
+                    context += f"{i}. {doc['text'][:500]}...\n\n"
+                
+                # Cache context
+                self.embedding_cache[query] = context
+                return context
+            except Exception as e:
+                return ""
+        
+        # Submit to thread pool
+        future = self.executor.submit(_get_context)
+        return future
+    
+    def cleanup(self):
+        """Cleanup resources and free memory"""
+        try:
+            if self.executor:
+                self.executor.shutdown(wait=False)
+            if self.embedding_model:
+                del self.embedding_model
+            if self.chroma_client:
+                del self.chroma_client
+            gc.collect()
+        except Exception as e:
+            pass
+
+# Initialize optimized RAG system
+rag_system = OptimizedRAGSystem()
+if rag_system.initialize():
+    rag_available = True
+    
+    # Add sample knowledge to the RAG system
+    sample_knowledge = [
+        "Python is a powerful programming language known for its simplicity and readability. It's widely used in web development, data science, and AI.",
+        "Streamlit is a Python framework for building interactive web applications quickly and easily. It's perfect for data science and machine learning projects.",
+        "MongoDB is a NoSQL database that stores data in flexible, JSON-like documents. It's great for applications that need to handle large amounts of unstructured data.",
+        "RAG (Retrieval-Augmented Generation) is a technique that combines information retrieval with text generation to provide more accurate and contextual responses.",
+        "The Dragon Developer is an AI assistant that helps with programming questions, code reviews, and technical guidance. It combines ancient wisdom with modern technology.",
+        "Vector databases like ChromaDB are used to store and retrieve embeddings for semantic search, making it easier to find relevant information based on meaning rather than keywords.",
+        "API keys are secure tokens that allow applications to authenticate with external services. They should be kept secret and stored in environment variables.",
+        "Error handling is crucial in programming. Always use try-except blocks to gracefully handle potential errors and provide meaningful feedback to users.",
+        "Code optimization involves improving the performance, readability, and maintainability of code. Good practices include using appropriate data structures and algorithms.",
+        "Version control with Git helps track changes in code over time, collaborate with others, and maintain a history of your project's development."
+    ]
+    
+    # Add sample knowledge to the RAG system
+    for knowledge in sample_knowledge:
+        try:
+            rag_system.add_document_async(knowledge, {"source": "dragon_wisdom", "type": "general"})
+        except Exception as e:
+            pass  # Continue if one fails
 
 # MongoDB connection
 mongo_client = None
 collection = None
 comments_collection = None
 tales_collection = None
-try:
-    mongo_client = MongoClient(MONGO_URI, serverSelectionTimeoutMS=5000)
-    mongo_client.server_info()
-    db = mongo_client.get_database('chatbotDB')
-    collection = db.get_collection('chats')
-    comments_collection = db.get_collection('comments')
-    tales_collection = db.get_collection('tales')
-    collection.create_index([("timestamp", -1)])
-    comments_collection.create_index([("timestamp", -1)])
-    tales_collection.create_index([("rating", -1)])
-    tales_collection.create_index([("title", "text")])
-except Exception as e:
-    st.warning(f"Couldn't connect to MongoDB: {str(e)}. Data will only persist in this session.")
+chat_collection = None
+knowledge_collection = None
+
+if MONGO_URI:
+    try:
+        mongo_client = MongoClient(MONGO_URI, serverSelectionTimeoutMS=5000)
+        mongo_client.server_info()
+        db = mongo_client.get_database('chatbotDB')
+        collection = db.get_collection('chats')
+        comments_collection = db.get_collection('comments')
+        tales_collection = db.get_collection('tales')
+        chat_collection = db.get_collection('chat_history')  # New collection for chat data
+        knowledge_collection = db.get_collection('knowledge_base')  # New collection for structured knowledge
+        collection.create_index([("timestamp", -1)])
+        comments_collection.create_index([("timestamp", -1)])
+        chat_collection.create_index([("timestamp", -1)])
+        knowledge_collection.create_index([("timestamp", -1)])
+        tales_collection.create_index([("rating", -1)])
+        tales_collection.create_index([("title", "text")])
+        mongo_available = True
+    except Exception as e:
+        st.warning(f"Couldn't connect to MongoDB: {str(e)}. Data will only persist in this session.")
+        mongo_available = False
+else:
+    st.warning("MONGO_URI not found. Database features will be limited.")
+    mongo_available = False
 
 # --- Custom system prompt with Dragon Developer theme ---
 your_style_prompt = """
@@ -331,6 +544,7 @@ st.markdown("""
 <script src="https://unpkg.com/@lottiefiles/lottie-player@latest/dist/lottie-player.js"></script>
 """, unsafe_allow_html=True)
 
+
 # --- Dragon Tales Functions ---
 def submit_tale(title, content, author="Anonymous Dragon"):
     """Submit a new dragon tale to the collection"""
@@ -525,6 +739,127 @@ except Exception as e:
 
 # --- Dragon's Tavern Comment Section ---
 with st.sidebar:
+    # Optimized RAG Knowledge Management Section
+    st.markdown("""
+    <h3 style="color:#ffa500; display:flex; align-items:center; font-family: 'Cinzel Decorative', cursive;">
+        <span class="dragon-emoji" style="font-size:1.8rem">🧠</span>
+        <span style="margin-left:10px;">Dragon's Knowledge</span>
+    </h3>
+    <p style="color:#ffd700; font-size:0.9rem;">
+        Optimized knowledge management with concurrent processing...
+    </p>
+    """, unsafe_allow_html=True)
+    
+    if rag_available:
+        # Add document to knowledge base (async)
+        with st.expander("📚 Add Knowledge (Async)", expanded=False):
+            doc_text = st.text_area("Enter knowledge to add:", height=100, 
+                                  placeholder="Share your wisdom with the dragon...")
+            doc_metadata = st.text_input("Metadata (optional):", 
+                                       placeholder="e.g., source, topic, date")
+            
+            if st.button("Add to Dragon Library 🐉", key="add_knowledge_async"):
+                if doc_text.strip():
+                    with st.spinner("Adding knowledge to dragon's library..."):
+                        future = rag_system.add_document_async(
+                            doc_text.strip(), 
+                            {"source": doc_metadata.strip() if doc_metadata.strip() else "user_input"}
+                        )
+                        try:
+                            success, message = future.result(timeout=10)
+                            if success:
+                                st.success(f"📚 {message}")
+                            else:
+                                st.error(f"❌ {message}")
+                        except Exception as e:
+                            st.error(f"❌ Timeout or error: {str(e)}")
+                else:
+                    st.warning("Please enter some knowledge to add!")
+        
+        # Search knowledge base (async with caching)
+        with st.expander("🔍 Search Knowledge (Optimized)", expanded=False):
+            search_query = st.text_input("Search the dragon's library:", 
+                                       placeholder="What wisdom do you seek?")
+            if st.button("Search 🧙‍♂️", key="search_knowledge_async"):
+                if search_query.strip():
+                    with st.spinner("Searching dragon's library..."):
+                        future = rag_system.search_knowledge_async(search_query.strip(), n_results=5)
+                        try:
+                            documents, message = future.result(timeout=8)
+                            if documents:
+                                st.success(f"Found {len(documents)} relevant documents!")
+                                for i, doc in enumerate(documents, 1):
+                                    with st.container():
+                                        st.markdown(f"**{i}. Relevance Score: {1-doc['distance']:.2f}**")
+                                        st.text(doc['text'][:200] + "..." if len(doc['text']) > 200 else doc['text'])
+                                        if doc['metadata']:
+                                            st.caption(f"Source: {doc['metadata']}")
+                            else:
+                                st.warning("No relevant knowledge found in the dragon's library.")
+                        except Exception as e:
+                            st.error(f"❌ Search timeout or error: {str(e)}")
+                else:
+                    st.warning("Please enter a search query!")
+        
+        # Performance monitoring
+        with st.expander("⚡ Performance Monitor", expanded=False):
+            st.metric("Cache Size", len(rag_system.embedding_cache))
+            st.metric("Result Cache", len(rag_system.result_cache))
+            st.metric("Thread Pool", "Active")
+            if st.button("Clear Cache 🧹", key="clear_cache"):
+                rag_system.embedding_cache.clear()
+                rag_system.result_cache.clear()
+                st.success("Cache cleared!")
+        
+        # Knowledge Analytics
+        with st.expander("📊 Knowledge Analytics", expanded=False):
+            if mongo_available and chat_collection is not None:
+                try:
+                    # Get chat statistics
+                    total_chats = chat_collection.count_documents({})
+                    recent_chats = chat_collection.count_documents({
+                        "timestamp": {"$gte": datetime.datetime.now(datetime.UTC) - datetime.timedelta(days=7)}
+                    })
+                    
+                    # Get topic distribution
+                    topic_pipeline = [
+                        {"$unwind": "$topics"},
+                        {"$group": {"_id": "$topics", "count": {"$sum": 1}}},
+                        {"$sort": {"count": -1}},
+                        {"$limit": 5}
+                    ]
+                    topic_stats = list(chat_collection.aggregate(topic_pipeline))
+                    
+                    col1, col2 = st.columns(2)
+                    with col1:
+                        st.metric("Total Conversations", total_chats)
+                        st.metric("This Week", recent_chats)
+                    
+                    with col2:
+                        st.metric("Knowledge Quality", f"{sum(doc.get('quality_score', 0) for doc in chat_collection.find()) / max(total_chats, 1):.1f}/5")
+                        st.metric("Active Sessions", len(set(doc.get('session_id', '') for doc in chat_collection.find())))
+                    
+                    if topic_stats:
+                        st.write("**Popular Topics:**")
+                        for topic in topic_stats:
+                            st.write(f"• {topic['_id']}: {topic['count']} conversations")
+                    
+                    # Show recent learning
+                    recent_learning = list(chat_collection.find().sort("timestamp", -1).limit(3))
+                    if recent_learning:
+                        st.write("**Recent Learning:**")
+                        for chat in recent_learning:
+                            st.write(f"• {chat['user_prompt'][:50]}... → Quality: {chat.get('quality_score', 0)}/5")
+                            
+                except Exception as e:
+                    st.warning(f"Analytics unavailable: {str(e)}")
+            else:
+                st.warning("Database not available for analytics")
+    else:
+        st.warning("🧠 RAG system is not available. Knowledge features are disabled.")
+    
+    st.markdown("---")
+    
     st.markdown("""
     <h3 style="color:#ffa500; display:flex; align-items:center; font-family: 'Cinzel Decorative', cursive;">
         <span class="dragon-emoji" style="font-size:1.8rem">🍻</span>
@@ -597,6 +932,36 @@ with st.sidebar:
     
     st.markdown("</div>", unsafe_allow_html=True)
 
+# --- Service Status Indicator ---
+st.markdown("""
+<div class="dragon-card" style="margin-bottom:1rem;">
+    <h4 style="color:#ffa500; margin-top:0; display:flex; align-items:center;">
+        <span class="dragon-emoji" style="font-size:1.5rem">⚡</span>
+        <span style="margin-left:10px;">Dragon Services Status</span>
+    </h4>
+    <div style="display:flex; gap:20px; flex-wrap:wrap;">
+        <div style="display:flex; align-items:center;">
+            <span style="color:#ffd700; font-size:1.2rem;">🤖</span>
+            <span style="color:#ffd700; margin-left:8px;">Gemini AI:</span>
+            <span style="color:#ffd700; margin-left:5px;">{"🟢 Active" if gemini_available else "🟡 Fallback Mode"}</span>
+        </div>
+        <div style="display:flex; align-items:center;">
+            <span style="color:#ffd700; font-size:1.2rem;">🗄️</span>
+            <span style="color:#ffd700; margin-left:8px;">Database:</span>
+            <span style="color:#ffd700; margin-left:5px;">{"🟢 Connected" if mongo_available else "🔴 Offline"}</span>
+        </div>
+        <div style="display:flex; align-items:center;">
+            <span style="color:#ffd700; font-size:1.2rem;">🧠</span>
+            <span style="color:#ffd700; margin-left:8px;">RAG System:</span>
+            <span style="color:#ffd700; margin-left:5px;">{"🟢 Active" if rag_available else "🔴 Offline"}</span>
+        </div>
+    </div>
+    <div style="margin-top:10px; padding:10px; background:rgba(255,215,0,0.1); border-radius:8px; border-left:3px solid #ffa500;">
+        <span style="color:#ffd700; font-size:0.9rem;">💡 System always provides responses using RAG knowledge and Dragon's Tavern wisdom, even when AI API is unavailable!</span>
+    </div>
+</div>
+""", unsafe_allow_html=True)
+
 # --- Enhanced Dragon Profile ---
 st.markdown("""
 <div class="dragon-card">
@@ -652,36 +1017,234 @@ from google.generativeai import GenerativeModel
 def generate_response(prompt: str, conversation_history: tuple):
     global LAST_REQUEST_TIME
 
-    current_time = time.time()
-    if current_time - LAST_REQUEST_TIME < MIN_REQUEST_INTERVAL:
-        time.sleep(MIN_REQUEST_INTERVAL - (current_time - LAST_REQUEST_TIME))
-    LAST_REQUEST_TIME = time.time()
+    # Get enhanced RAG context from multiple sources
+    rag_context = get_enhanced_rag_context(prompt)
 
-    retries = 3
-    backoff = 1
+    # If Gemini API is available, use it with RAG context
+    if gemini_available:
+        current_time = time.time()
+        if current_time - LAST_REQUEST_TIME < MIN_REQUEST_INTERVAL:
+            time.sleep(MIN_REQUEST_INTERVAL - (current_time - LAST_REQUEST_TIME))
+        LAST_REQUEST_TIME = time.time()
 
-    # Initialize model (you can do this once globally if needed)
-    model = GenerativeModel("gemini-2.0-flash")
+        retries = 3
+        backoff = 1
 
-    for _ in range(retries):
+        # Initialize model (you can do this once globally if needed)
         try:
-            full_prompt = f"{your_style_prompt}\n\nCurrent conversation:\n"
-            for role, content in conversation_history:
-                full_prompt += f"{role}: {content}\n"
-            full_prompt += f"assistant: "
-
-            # Gemini expects content as a string or list of parts
-            response = model.generate_content(full_prompt)
-            return response.text
-        
+            model = GenerativeModel("gemini-2.0-flash")
         except Exception as e:
-            if "RATE_LIMIT_EXCEEDED" in str(e):
-                time.sleep(backoff)
-                backoff *= 2
-            else:
-                return f"Dragon fire temporarily dimmed ⚡ Error: {str(e)} 🔥 Please try again when the flames reignite"
+            # Fall back to RAG-only response
+            return generate_rag_only_response(prompt, rag_context)
+
+        for _ in range(retries):
+            try:
+                # Build enhanced prompt with RAG context
+                full_prompt = f"{your_style_prompt}\n\n"
+                
+                if rag_context:
+                    full_prompt += f"{rag_context}\n\n"
+                    full_prompt += "Use the above knowledge to provide accurate and helpful responses. If the knowledge doesn't contain relevant information, you can still provide general assistance.\n\n"
+                
+                full_prompt += "Current conversation:\n"
+                for role, content in conversation_history:
+                    full_prompt += f"{role}: {content}\n"
+                full_prompt += f"assistant: "
+
+                # Gemini expects content as a string or list of parts
+                response = model.generate_content(full_prompt)
+                return response.text
+            
+            except Exception as e:
+                if "RATE_LIMIT_EXCEEDED" in str(e):
+                    time.sleep(backoff)
+                    backoff *= 2
+                else:
+                    # Fall back to RAG-only response
+                    return generate_rag_only_response(prompt, rag_context)
+        
+        # If all retries failed, fall back to RAG-only response
+        return generate_rag_only_response(prompt, rag_context)
     
-    return "The dragon's breath is too hot 🚦 Wait 2 minutes before approaching again ✨"
+    else:
+        # API not available, use RAG-only response
+        return generate_rag_only_response(prompt, rag_context)
+
+def save_chat_to_database(user_prompt: str, dragon_response: str, conversation_history: tuple):
+    """Save chat conversation to database for knowledge expansion"""
+    if mongo_available and chat_collection is not None:
+        try:
+            # Create structured chat document
+            chat_doc = {
+                "timestamp": datetime.datetime.now(datetime.UTC),
+                "user_prompt": user_prompt,
+                "dragon_response": dragon_response,
+                "conversation_length": len(conversation_history),
+                "response_type": "ai_enhanced" if gemini_available else "rag_fallback",
+                "topics": extract_topics(user_prompt),
+                "quality_score": calculate_response_quality(dragon_response),
+                "session_id": st.session_state.get('session_id', 'default')
+            }
+            
+            # Save to chat collection
+            chat_collection.insert_one(chat_doc)
+            
+            # Also save to knowledge base if response is substantial
+            if len(dragon_response) > 100 and "🐉" in dragon_response:
+                knowledge_doc = {
+                    "timestamp": datetime.datetime.now(datetime.UTC),
+                    "content": f"User: {user_prompt}\nDragon: {dragon_response}",
+                    "source": "chat_conversation",
+                    "topics": extract_topics(user_prompt),
+                    "quality_score": calculate_response_quality(dragon_response),
+                    "session_id": st.session_state.get('session_id', 'default')
+                }
+                knowledge_collection.insert_one(knowledge_doc)
+                
+                # Add to RAG system asynchronously
+                if rag_available:
+                    try:
+                        rag_system.add_document_async(
+                            f"Q: {user_prompt}\nA: {dragon_response}",
+                            {"source": "chat_conversation", "timestamp": datetime.datetime.now(datetime.UTC).isoformat()}
+                        )
+                    except Exception as e:
+                        pass  # Continue if RAG fails
+                        
+        except Exception as e:
+            pass  # Continue if database save fails
+
+def extract_topics(text: str):
+    """Extract topics from text for better categorization"""
+    topics = []
+    text_lower = text.lower()
+    
+    # Programming topics
+    if any(word in text_lower for word in ['python', 'code', 'programming', 'function', 'class', 'variable']):
+        topics.append('programming')
+    if any(word in text_lower for word in ['streamlit', 'web', 'app', 'interface']):
+        topics.append('web_development')
+    if any(word in text_lower for word in ['database', 'mongodb', 'sql', 'data']):
+        topics.append('database')
+    if any(word in text_lower for word in ['ai', 'machine learning', 'neural', 'model']):
+        topics.append('ai_ml')
+    if any(word in text_lower for word in ['error', 'bug', 'debug', 'fix']):
+        topics.append('troubleshooting')
+    if any(word in text_lower for word in ['help', 'how', 'what', 'why', 'explain']):
+        topics.append('general_help')
+    
+    return topics if topics else ['general']
+
+def calculate_response_quality(response: str):
+    """Calculate quality score for response"""
+    score = 0
+    
+    # Length bonus
+    if len(response) > 200:
+        score += 1
+    if len(response) > 500:
+        score += 1
+    
+    # Content quality indicators
+    if "🐉" in response:
+        score += 1  # Dragon personality
+    if any(word in response.lower() for word in ['code', 'function', 'class', 'variable']):
+        score += 1  # Technical content
+    if any(word in response.lower() for word in ['example', 'try', 'suggest', 'recommend']):
+        score += 1  # Actionable advice
+    if response.count('\n') > 2:
+        score += 1  # Well-structured
+    
+    return min(score, 5)  # Max score of 5
+
+def get_enhanced_rag_context(prompt: str):
+    """Get enhanced RAG context from multiple sources"""
+    context_parts = []
+    
+    # Get RAG context from knowledge base
+    if rag_available:
+        try:
+            future = rag_system.get_rag_context_async(prompt)
+            rag_context = future.result(timeout=3)
+            if rag_context:
+                context_parts.append(f"Knowledge Base: {rag_context}")
+        except Exception as e:
+            pass
+    
+    # Get recent chat conversations
+    if mongo_available and chat_collection is not None:
+        try:
+            recent_chats = list(chat_collection.find().sort("timestamp", -1).limit(3))
+            if recent_chats:
+                chat_context = "Recent conversations:\n"
+                for chat in recent_chats:
+                    chat_context += f"Q: {chat['user_prompt'][:100]}...\nA: {chat['dragon_response'][:100]}...\n\n"
+                context_parts.append(chat_context)
+        except Exception as e:
+            pass
+    
+    # Get tavern comments
+    if mongo_available and comments_collection is not None:
+        try:
+            recent_comments = list(comments_collection.find().sort("timestamp", -1).limit(3))
+            if recent_comments:
+                tavern_context = "Dragon's Tavern wisdom:\n"
+                for comment in recent_comments:
+                    tavern_context += f"• {comment['text'][:100]}...\n"
+                context_parts.append(tavern_context)
+        except Exception as e:
+            pass
+    
+    return "\n\n".join(context_parts) if context_parts else ""
+
+def generate_rag_only_response(prompt: str, rag_context: str):
+    """Generate response using only RAG knowledge when AI API is unavailable"""
+    
+    # Get enhanced context from multiple sources
+    enhanced_context = get_enhanced_rag_context(prompt)
+    
+    # If we have RAG context, use it to generate a response
+    if rag_context or enhanced_context:
+        response = f"🐉 By the ancient wisdom of the dragon's library! 🔥\n\n"
+        
+        if rag_context:
+            response += f"{rag_context}\n\n"
+        
+        if enhanced_context:
+            response += f"{enhanced_context}\n\n"
+        
+        response += "Based on the knowledge from my vast library, I can help you with this. "
+        
+        # Add some dragon-themed guidance based on the context
+        if "code" in prompt.lower() or "programming" in prompt.lower():
+            response += "The dragon's code wisdom suggests focusing on clean, efficient implementations that burn bright like dragon fire! 💻✨"
+        elif "help" in prompt.lower() or "how" in prompt.lower():
+            response += "The ancient scrolls reveal that the path to mastery lies in persistent practice and learning from the wisdom of others! 🏮"
+        else:
+            response += "The dragon's knowledge illuminates your path forward! ✨"
+            
+        return response
+    
+    # If no RAG context, provide a helpful fallback response
+    else:
+        response = "🐉 The dragon's wisdom flows through me, though my main scrolls are currently sealed! 🔒\n\n"
+        response += "While I cannot access my full knowledge at this moment, I can still offer guidance:\n\n"
+        
+        # Provide some general dragon wisdom
+        if "code" in prompt.lower() or "programming" in prompt.lower():
+            response += "💻 For coding wisdom: Remember that great code is like dragon fire - clean, powerful, and purposeful! 🔥\n"
+        elif "help" in prompt.lower():
+            response += "🏮 For guidance: The path to mastery is through continuous learning and practice! ✨\n"
+        else:
+            response += "✨ The dragon's spirit guides you - trust in your abilities and keep learning! 🐉\n"
+        
+        response += "\n🍻 Check the Dragon's Tavern for recent wisdom from fellow adventurers!"
+        
+        return response
+
+# Initialize session ID if not exists
+if 'session_id' not in st.session_state:
+    st.session_state.session_id = f"session_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}"
 
 # Chat input
 if prompt := st.chat_input("Speak your question to the dragon...", key="chat_input"):
@@ -727,6 +1290,9 @@ if prompt := st.chat_input("Speak your question to the dragon...", key="chat_inp
             response_container.markdown(formatted_response, unsafe_allow_html=True)
 
     st.session_state.messages.append({"role": "assistant", "content": reply})
+    
+    # Save conversation to database for knowledge expansion
+    save_chat_to_database(prompt, reply, conversation_history)
 
     if collection is not None:
         try:
