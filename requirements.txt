@@ -9,7 +9,6 @@ watchdog>=6.0.0
 # Optimized RAG Dependencies
 sentence-transformers>=2.2.2
 chromadb>=0.4.22
-asyncio
-concurrent.futures
-threading
-queue
+
+# Note: removed stdlib modules (asyncio, concurrent.futures, threading, queue)
+# which are part of Python and should not appear in requirements.txt
