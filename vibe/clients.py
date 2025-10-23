@@ -29,11 +29,43 @@ def create_groq_client() -> Optional[object]:
     key = getattr(settings, 'GROQ_API_KEY', None)
     if not url or not key:
         return None
+    # Prefer official OpenAI Python SDK if available (it can be pointed at Groq via base_url)
     try:
-        from .groq import GroqClient
-        return GroqClient(api_url=url, api_key=key)
+        from openai import OpenAI as OpenAISDK
+
+        class _SDKWrapper:
+            def __init__(self, api_key: str, base_url: str):
+                # instantiate official client with provided base_url
+                self._client = OpenAISDK(api_key=api_key, base_url=base_url)
+
+            def generate(self, prompt: str, model: str = None) -> str:
+                # Use the /responses compatibility surface
+                kwargs = {
+                    "model": model or settings.OPENAI_MODEL,
+                    "input": prompt,
+                }
+                resp = self._client.responses.create(**kwargs)
+                # Try common fields
+                if isinstance(resp, dict):
+                    for k in ("output_text", "output", "result", "text"):
+                        if k in resp:
+                            return resp[k]
+                    # attempt to stringify
+                    return str(resp)
+                # SDK may return an object with .output_text
+                try:
+                    return getattr(resp, "output_text", str(resp))
+                except Exception:
+                    return str(resp)
+
+        return _SDKWrapper(api_key=key, base_url=url)
     except Exception:
-        return None
+        # Fallback to internal GroqClient wrapper
+        try:
+            from .groq import GroqClient
+            return GroqClient(api_url=url, api_key=key)
+        except Exception:
+            return None
 
 
 def create_openai_client() -> Optional[object]:
@@ -41,11 +73,29 @@ def create_openai_client() -> Optional[object]:
     key = getattr(settings, 'OPENAI_API_KEY', None)
     if not url or not key:
         return None
+    # Prefer official SDK when available
     try:
-        from .openai import OpenAIClient
-        return OpenAIClient(api_url=url, api_key=key)
+        from openai import OpenAI as OpenAISDK
+
+        class _SDKOpenAIWrapper:
+            def __init__(self, api_key: str, base_url: str):
+                self._client = OpenAISDK(api_key=api_key, base_url=base_url)
+
+            def generate(self, prompt: str, model: str = None) -> str:
+                kwargs = {"model": model or settings.OPENAI_MODEL, "input": prompt}
+                resp = self._client.responses.create(**kwargs)
+                try:
+                    return getattr(resp, "output_text", str(resp))
+                except Exception:
+                    return str(resp)
+
+        return _SDKOpenAIWrapper(api_key=key, base_url=url)
     except Exception:
-        return None
+        try:
+            from .openai import OpenAIClient
+            return OpenAIClient(api_url=url, api_key=key)
+        except Exception:
+            return None
 
 
 def init_genai(api_key: str | None) -> bool:
