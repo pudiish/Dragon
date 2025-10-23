@@ -5,6 +5,14 @@ import datetime
 import requests
 import json
 from functools import lru_cache
+import datetime as _dt
+from pathlib import Path
+from vibe.config import settings as vibe_settings
+from vibe import utils as vibe_utils
+from vibe import clients as vibe_clients
+OFFLINE_MODE = False
+genai_available = False
+genai = None
 from pymongo import MongoClient
 import base64
 from io import BytesIO
@@ -18,53 +26,109 @@ st.set_page_config(
     initial_sidebar_state="collapsed"
 )
 
+# Prominent OFFLINE MODE banner (hidden when online)
+_persisted_state_file = vibe_utils.persisted_offline_file
+_read_persisted_offline = vibe_utils.read_persisted_offline
+_write_persisted_offline = vibe_utils.write_persisted_offline
+
+# initialize session state for OFFLINE_MODE from persisted file or defaults
+_persisted = _read_persisted_offline()
+if 'OFFLINE_MODE' not in st.session_state:
+    st.session_state['OFFLINE_MODE'] = _persisted if _persisted is not None else False
+
 # --- Try importing new google.genai client ---
+# Be permissive here so the app can run in offline / degraded mode.
+genai = None
+genai_available = False
 try:
-    import google.generativeai as genai
-    from dotenv import load_dotenv
-    import os
-except ImportError:
-    st.error("Required package not found. Please install with: pip install google-genai")
-    st.stop()
+    import google.generativeai as genai  # optional
+    genai_available = True
+except Exception:
+    genai = None
+    genai_available = False
+
+from dotenv import load_dotenv
+import os
 
 # --- Configuration ---
-
-# Load environment variables from .env file
 load_dotenv()
 
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 MONGO_URI = os.getenv("MONGO_URI")
 
-if not GEMINI_API_KEY or not MONGO_URI:
-    st.error("Environment variables GEMINI_API_KEY and MONGO_URI must be set in the .env file.")
-    st.stop()
+# Run in degraded/offline mode when keys or packages are missing; warn instead of stopping
+OFFLINE_MODE = False
+if not GEMINI_API_KEY:
+    st.warning("GEMINI_API_KEY not set: running in OFFLINE MODE (LLM disabled).")
+    OFFLINE_MODE = True
+if not MONGO_URI:
+    st.warning("MONGO_URI not set: running in OFFLINE MODE (DB disabled).")
+    OFFLINE_MODE = True
+if not genai_available:
+    st.warning("Optional package 'google.generativeai' not installed: LLM features disabled.")
+    OFFLINE_MODE = True
 
-# Initialize GenAI client
-genai.configure(api_key=GEMINI_API_KEY)
-try:
-    genai.configure(api_key=GEMINI_API_KEY)
-except Exception as e:
-    st.error(f"Failed to initialize Gemini Client: {str(e)}")
-    st.stop()
+# reflect into session state unless user explicitly persisted a different setting
+if _persisted is None:
+    st.session_state['OFFLINE_MODE'] = OFFLINE_MODE
+
+# Determine initial OFFLINE_MODE: config default then persisted override
+OFFLINE_MODE = bool(vibe_settings.OFFLINE_DEFAULT)
+if _persisted is not None:
+    OFFLINE_MODE = _persisted
+
+# Sidebar: allow toggling and persist the choice
+with st.sidebar:
+    st.markdown("### Runtime Mode")
+    sim_offline = st.checkbox("Force OFFLINE MODE (persisted)", value=OFFLINE_MODE)
+    if sim_offline != st.session_state.get('OFFLINE_MODE'):
+        st.session_state['OFFLINE_MODE'] = sim_offline
+        _write_persisted_offline(sim_offline)
+
+# Display a subtle offline icon in the header instead of full banner
+def _render_offline_icon():
+    st.markdown("""
+    <div style="position:absolute; top:18px; right:22px;">
+        <span title="OFFLINE MODE: some features (LLM, DB, TTS) are limited" style="background:#33110a; color:#ffd700; padding:6px 10px; border-radius:12px; border:1px solid #ff8c00; font-weight:600;">OFFLINE</span>
+    </div>
+    """, unsafe_allow_html=True)
+
+# ensure session_state matches the computed OFFLINE_MODE unless user persisted preference exists
+if _persisted is None:
+    st.session_state['OFFLINE_MODE'] = OFFLINE_MODE
+
+if st.session_state.get('OFFLINE_MODE'):
+    _render_offline_icon()
+
+# Try to configure the Gemini client only when available and we have a key.
+if GEMINI_API_KEY:
+    ok = vibe_clients.init_genai(GEMINI_API_KEY)
+    if ok:
+        genai_available = True
+    else:
+        OFFLINE_MODE = True
+        st.warning("Failed to initialize Gemini Client: initialization error. LLM disabled.")
 
 # MongoDB connection
 mongo_client = None
 collection = None
 comments_collection = None
 tales_collection = None
-try:
-    mongo_client = MongoClient(MONGO_URI, serverSelectionTimeoutMS=5000)
-    mongo_client.server_info()
-    db = mongo_client.get_database('chatbotDB')
-    collection = db.get_collection('chats')
-    comments_collection = db.get_collection('comments')
-    tales_collection = db.get_collection('tales')
-    collection.create_index([("timestamp", -1)])
-    comments_collection.create_index([("timestamp", -1)])
-    tales_collection.create_index([("rating", -1)])
-    tales_collection.create_index([("title", "text")])
-except Exception as e:
-    st.warning(f"Couldn't connect to MongoDB: {str(e)}. Data will only persist in this session.")
+mongo_client = vibe_clients.create_mongo_client()
+if mongo_client is not None:
+    try:
+        db = mongo_client.get_database('chatbotDB')
+        collection = db.get_collection('chats')
+        comments_collection = db.get_collection('comments')
+        tales_collection = db.get_collection('tales')
+        collection.create_index([("timestamp", -1)])
+        comments_collection.create_index([("timestamp", -1)])
+        tales_collection.create_index([("rating", -1)])
+        tales_collection.create_index([("title", "text")])
+    except Exception as e:
+        st.warning(f"Couldn't configure MongoDB collections: {str(e)}. Data will only persist in this session.")
+else:
+    st.warning("MongoDB not configured or unreachable. Data will only persist in this session.")
 
 # --- Custom system prompt with Dragon Developer theme ---
 your_style_prompt = """
@@ -341,7 +405,7 @@ def submit_tale(title, content, author="Anonymous Dragon"):
             "author": author,
             "rating": 0,
             "ratings_count": 0,
-            "timestamp": datetime.datetime.utcnow()
+            "timestamp": _dt.datetime.now(_dt.timezone.utc)
         }
         
         if tales_collection is not None:
@@ -545,7 +609,7 @@ with st.sidebar:
             try:
                 comment_data = {
                     "text": comment.strip(),
-                    "timestamp": datetime.datetime.utcnow(),
+                    "timestamp": _dt.datetime.now(_dt.timezone.utc),
                     "user": "Anonymous Dragon"
                 }
                 
@@ -645,7 +709,6 @@ for msg in st.session_state.messages:
 # Rate limiting variables
 LAST_REQUEST_TIME = 0
 MIN_REQUEST_INTERVAL = 1.2  # seconds
-from google.generativeai import GenerativeModel
 
 @lru_cache(maxsize=100)
 
@@ -659,12 +722,21 @@ def generate_response(prompt: str, conversation_history: tuple):
 
     retries = 3
     backoff = 1
-
-    # Initialize model (you can do this once globally if needed)
-    model = GenerativeModel("gemini-2.0-flash")
+    # If we're offline (as set in session state) or the genai client isn't available,
+    # return a friendly offline message instead of attempting network calls.
+    if st.session_state.get('OFFLINE_MODE', False) or not genai_available:
+        return "(OFFLINE MODE) The Dragon's LLM is currently unavailable — responses are disabled while offline."
 
     for _ in range(retries):
         try:
+            # Import and instantiate the model lazily to avoid import-time errors
+            try:
+                from google.generativeai import GenerativeModel
+            except Exception as e:
+                return f"(LLM error) Could not import GenerativeModel: {str(e)}"
+
+            model = GenerativeModel("gemini-2.0-flash")
+
             full_prompt = f"{your_style_prompt}\n\nCurrent conversation:\n"
             for role, content in conversation_history:
                 full_prompt += f"{role}: {content}\n"
@@ -673,14 +745,19 @@ def generate_response(prompt: str, conversation_history: tuple):
             # Gemini expects content as a string or list of parts
             response = model.generate_content(full_prompt)
             return response.text
-        
+
         except Exception as e:
+            # If Gemini fails, try Groq/OpenAI-compatible fallback
+            groq_text = vibe_clients.call_groq(full_prompt, model="openai/gpt-oss-20b")
+            if groq_text:
+                return groq_text
+
             if "RATE_LIMIT_EXCEEDED" in str(e):
                 time.sleep(backoff)
                 backoff *= 2
             else:
                 return f"Dragon fire temporarily dimmed ⚡ Error: {str(e)} 🔥 Please try again when the flames reignite"
-    
+
     return "The dragon's breath is too hot 🚦 Wait 2 minutes before approaching again ✨"
 
 # Chat input
@@ -733,7 +810,7 @@ if prompt := st.chat_input("Speak your question to the dragon...", key="chat_inp
             collection.insert_one({
                 "user": prompt,
                 "bot": reply,
-                "timestamp": datetime.datetime.utcnow(),
+                "timestamp": _dt.datetime.now(_dt.timezone.utc),
                 "session_id": st.session_state.get("session_id", "default")
             })
         except Exception as e:

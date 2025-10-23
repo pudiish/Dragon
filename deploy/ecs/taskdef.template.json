@@ -1,0 +1,28 @@
+{
+  "family": "dragon-task",
+  "networkMode": "awsvpc",
+  "requiresCompatibilities": ["FARGATE"],
+  "cpu": "512",
+  "memory": "1024",
+  "containerDefinitions": [
+    {
+      "name": "dragon",
+      "image": "<ACCOUNT_ID>.dkr.ecr.<REGION>.amazonaws.com/<REPO>:<TAG>",
+      "portMappings": [
+        { "containerPort": 8501, "protocol": "tcp" }
+      ],
+      "essential": true,
+      "environment": [
+        {"name": "STREAMLIT_SERVER_PORT", "value": "8501"}
+      ],
+      "logConfiguration": {
+        "logDriver": "awslogs",
+        "options": {
+          "awslogs-group": "/ecs/dragon",
+          "awslogs-region": "<REGION>",
+          "awslogs-stream-prefix": "ecs"
+        }
+      }
+    }
+  ]
+}

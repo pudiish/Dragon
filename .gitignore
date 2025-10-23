@@ -4,3 +4,26 @@
 myenv
 .venv
 temp_audio.mp3
+
+# Ignore persisted local config and health files
+.config/dragon/
+.offline_state.json
+.health_status.json
+
+# macOS
+.DS_Store
+
+# IDE
+.idea/
+
+# Logs
+streamlit.log
+
+# Model/cache directories
+model_cache/
+
+# Static assets moved to assets/
+dragon.lottie
+
+# Scripts and helpers that are local-only
+groq_test.mjs

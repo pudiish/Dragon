@@ -1,0 +1,64 @@
+name: CI Build & Deploy to AWS ECR/ECS
+
+on:
+  push:
+    branches: [ main ]
+  workflow_dispatch:
+
+jobs:
+  build-and-push:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v2
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ secrets.AWS_REGION }}
+
+      - name: Login to Amazon ECR
+        uses: aws-actions/amazon-ecr-login@v1
+
+      - name: Build, tag, and push image to ECR
+        id: build
+        env:
+          ECR_REPOSITORY: ${{ secrets.ECR_REPOSITORY }}
+          IMAGE_TAG: ${{ github.sha }}
+        run: |
+          IMAGE_URI=$(aws ecr describe-repositories --repository-names "$ECR_REPOSITORY" --query 'repositories[0].repositoryUri' --output text)
+          if [ -z "$IMAGE_URI" ]; then
+            IMAGE_URI=$(aws ecr create-repository --repository-name "$ECR_REPOSITORY" --query 'repository.repositoryUri' --output text)
+          fi
+          docker build -t "$IMAGE_URI:$IMAGE_TAG" .
+          docker push "$IMAGE_URI:$IMAGE_TAG"
+          echo "IMAGE_URI=$IMAGE_URI" >> $GITHUB_OUTPUT
+
+      - name: Render taskdef from template
+        env:
+          IMAGE_URI: ${{ steps.build.outputs.IMAGE_URI }}
+          IMAGE_TAG: ${{ github.sha }}
+        run: |
+          # Render the template by substituting placeholders; adjust as needed
+          sed -e "s|<ACCOUNT_ID>|${{ secrets.AWS_ACCOUNT_ID }}|g" \
+              -e "s|<REGION>|${{ secrets.AWS_REGION }}|g" \
+              -e "s|<REPO>|${{ secrets.ECR_REPOSITORY }}|g" \
+              -e "s|<TAG>|${{ github.sha }}|g" \
+              deploy/ecs/taskdef.template.json > taskdef.json || true
+
+      - name: Deploy to ECS (force new deployment)
+        env:
+          AWS_REGION: ${{ secrets.AWS_REGION }}
+          CLUSTER: ${{ secrets.ECS_CLUSTER }}
+          SERVICE: ${{ secrets.ECS_SERVICE }}
+          IMAGE_URI: ${{ steps.build.outputs.IMAGE_URI }}
+          IMAGE_TAG: ${{ github.sha }}
+        run: |
+          if [ -f taskdef.json ]; then
+            aws ecs register-task-definition --cli-input-json file://taskdef.json
+          else
+            echo "taskdef.json not found; aborting register-task-definition"
+          fi
+          aws ecs update-service --cluster "$CLUSTER" --service "$SERVICE" --force-new-deployment || true
