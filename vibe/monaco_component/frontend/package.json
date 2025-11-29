@@ -1,0 +1,27 @@
+{
+  "name": "vibe-monaco-component",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Streamlit custom component that embeds Monaco editor with two-way sync",
+  "scripts": {
+    "start": "webpack --mode development --watch",
+    "build": "webpack --mode production"
+  },
+  "dependencies": {
+    "react": "^18.2.0",
+    "react-dom": "^18.2.0",
+    "monaco-editor": "^0.43.0",
+  "streamlit-component-lib": "^1.4.0"
+  },
+  "devDependencies": {
+    "webpack": "^5.88.0",
+    "webpack-cli": "^5.1.0",
+    "babel-loader": "^9.1.2",
+    "@babel/core": "^7.22.19",
+    "@babel/preset-react": "^7.22.5",
+    "style-loader": "^3.3.3",
+    "css-loader": "^6.8.1",
+  "monaco-editor-webpack-plugin": "^10.1.2",
+    "html-webpack-plugin": "^5.5.1"
+  }
+}

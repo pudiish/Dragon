@@ -1,0 +1,41 @@
+const path = require('path');
+const HtmlWebpackPlugin = require('html-webpack-plugin');
+const MonacoWebpackPlugin = require('monaco-editor-webpack-plugin');
+
+module.exports = {
+  mode: process.env.NODE_ENV || 'production',
+  entry: path.resolve(__dirname, 'src/index.js'),
+  output: {
+    path: path.resolve(__dirname, 'build'),
+    filename: 'bundle.js',
+    publicPath: ''
+  },
+  module: {
+    rules: [
+      {
+        test: /\.css$/,
+        use: ['style-loader', 'css-loader']
+      },
+      {
+        test: /\.js$/,
+        exclude: /node_modules/,
+        use: {
+          loader: 'babel-loader',
+          options: {
+            presets: ['@babel/preset-react']
+          }
+        }
+      }
+    ]
+  },
+  plugins: [
+    new HtmlWebpackPlugin({ template: path.resolve(__dirname, 'public/index.html') }),
+    new MonacoWebpackPlugin()
+  ],
+  resolve: {
+    fallback: {
+      fs: false,
+      path: false
+    }
+  }
+};

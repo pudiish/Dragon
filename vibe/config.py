@@ -1,6 +1,10 @@
 import os
 from dataclasses import dataclass
-from dotenv import load_dotenv
+try:
+    from dotenv import load_dotenv
+except Exception:
+    def load_dotenv():
+        return None
 
 load_dotenv()
 

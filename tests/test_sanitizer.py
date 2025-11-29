@@ -1,0 +1,46 @@
+from pathlib import Path
+import ast
+
+# Read the app.py source and extract only the _sanitize_and_validate_code function using AST
+root = Path(__file__).resolve().parents[1]
+app_path = root / 'app.py'
+src = app_path.read_text()
+module = ast.parse(src)
+func_node = None
+for node in module.body:
+    if isinstance(node, ast.FunctionDef) and node.name == '_sanitize_and_validate_code':
+        func_node = node
+        break
+
+if func_node is None:
+    raise RuntimeError('Could not find _sanitize_and_validate_code in app.py')
+
+# Python AST nodes have lineno and end_lineno attributes
+start = func_node.lineno - 1
+end = func_node.end_lineno
+lines = src.splitlines()
+func_src = '\n'.join(lines[start:end])
+
+# Ensure the executed namespace has imports used inside the function
+ns = {'os': __import__('os'), 're': __import__('re')}
+exec(func_src, ns)
+_sanitize_and_validate_code = ns['_sanitize_and_validate_code']
+
+cases = [
+    ('print hello world', 'print("hello world")'),
+    ("print 'hi'", "print('hi')"),
+    ('print("already ok")', 'print("already ok")'),
+    ('Some prose\nprint 42\nmore prose', 'print("42")'),
+    ('```\nprint("fenced")\n```', 'print("fenced")')
+]
+
+for inp, expected in cases:
+    out = _sanitize_and_validate_code(inp, lang='python')
+    print('IN:')
+    print(inp)
+    print('\nOUT:')
+    print(out)
+    print('\nEXPECTED CONTAINS:')
+    print(expected)
+    print('\nPASS:', expected in out)
+    print('\n' + ('-'*40) + '\n')

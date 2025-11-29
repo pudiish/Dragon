@@ -1,0 +1,37 @@
+from app import generate_response, _sanitize_and_validate_code
+import re
+
+# Simulate a simple playground generate flow for the given prompt
+prompt_text = 'write a code for print  hello world'
+lang = 'python'
+
+instruction = (
+    f"You are given the task: {prompt_text}\n"
+    "REQUIREMENT: Return ONLY valid Python 3 code. "
+    "Do NOT include any explanation, headings, markdown, or code fences — only raw source code."
+)
+
+conv = tuple()
+print('Calling generate_response... (may return offline message in this environment)')
+gen = generate_response(instruction, conv, skip_style=True)
+print('Raw generator output:')
+print(gen)
+
+# Extract code if in fences
+m = re.search(r"```(?:\w+)?\n([\s\S]*?)\n```", str(gen))
+if m:
+    code_text = m.group(1)
+else:
+    code_text = str(gen)
+
+san = _sanitize_and_validate_code(code_text, lang=lang)
+print('\nSanitized result:')
+print(san)
+
+if not san:
+    print('\nSanitizer failed; deterministic fallback:')
+    p = prompt_text.lower()
+    if 'print' in p and 'hello' in p:
+        print('print("hello world")')
+    else:
+        print('No fallback available')
