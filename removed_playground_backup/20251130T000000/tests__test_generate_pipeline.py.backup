@@ -1,0 +1,35 @@
+```python
+import importlib.util
+from pathlib import Path
+
+# Load the utils module directly to avoid package-level side-effects during tests
+utils_path = Path(__file__).resolve().parents[1] / 'vibe' / 'utils.py'
+spec = importlib.util.spec_from_file_location('vibe_utils', str(utils_path))
+vu = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(vu)
+
+
+def test_sanitize_simple_print():
+    out = vu.process_generated_code('print hello world', 'write a code for print hello world', lang='python')
+    assert out.strip() == 'print("hello world")'
+
+
+def test_strip_fences_and_return():
+    raw = 'Here is the code:\n```\nprint("fenced")\n```'
+    out = vu.process_generated_code(raw, 'print fenced', lang='python')
+    assert 'print("fenced")' in out
+
+
+def test_fallback_when_prose_returned():
+    # Model returns prose instead of code
+    raw = 'By the ancient scales of the dragon, your script is ready.'
+    out = vu.process_generated_code(raw, 'write a code for print hello world', lang='python')
+    assert out.strip() == 'print("hello world")'
+
+
+def test_non_python_returns_raw_for_other_lang():
+    raw = '<div>Hello</div>'
+    out = vu.process_generated_code(raw, 'make html', lang='html')
+    assert '<div>' in out
+
+```
