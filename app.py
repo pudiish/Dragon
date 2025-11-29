@@ -15,6 +15,8 @@ genai_available = False
 genai = None
 from pymongo import MongoClient
 import base64
+import uuid
+import streamlit.components.v1 as components
 from io import BytesIO
 from typing import Optional
 
@@ -47,11 +49,55 @@ except Exception:
     genai = None
     genai_available = False
 
-from dotenv import load_dotenv
-import os
+try:
+    from dotenv import load_dotenv
+except Exception:
+    # Allow running without python-dotenv installed in lightweight/dev environments
+    def load_dotenv():
+        return None
 
 # --- Configuration ---
 load_dotenv()
+
+# Safe rerun helper: some Streamlit versions don't provide experimental_rerun
+def safe_rerun():
+    try:
+        rerun_fn = getattr(st, 'experimental_rerun', None)
+        if callable(rerun_fn):
+            rerun_fn()
+            return
+    except Exception:
+        pass
+    # Fallback: toggle a session flag to hint at refresh
+    st.session_state['_need_refresh'] = st.session_state.get('_need_refresh', 0) + 1
+
+
+# Lightweight code runner used by the playground
+def _run_code_safely(code: str, lang: str = "python", timeout: int = 5):
+    import subprocess, tempfile, sys
+    if lang != "python":
+        return {"success": False, "stdout": "", "stderr": f"Unsupported language: {lang}"}
+
+    with tempfile.NamedTemporaryFile(mode="w", suffix=".py", delete=False) as tf:
+        tf.write(code)
+        tf.flush()
+        tmp_path = tf.name
+
+    try:
+        proc = subprocess.run([sys.executable, tmp_path], capture_output=True, text=True, timeout=timeout)
+        return {"success": proc.returncode == 0, "stdout": proc.stdout, "stderr": proc.stderr}
+    except subprocess.TimeoutExpired:
+        return {"success": False, "stdout": "", "stderr": f"Timeout after {timeout}s"}
+    except Exception as e:
+        return {"success": False, "stdout": "", "stderr": str(e)}
+
+
+def _sanitize_and_validate_code(code: str, lang: str = 'python') -> str:
+    # shim to the reusable util function
+    try:
+        return vibe_utils.sanitize_and_validate_code(code, lang=lang)
+    except Exception:
+        return ''
 
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 MONGO_URI = os.getenv("MONGO_URI")
@@ -395,6 +441,317 @@ st.markdown("""
 <script src="https://unpkg.com/@lottiefiles/lottie-player@latest/dist/lottie-player.js"></script>
 """, unsafe_allow_html=True)
 
+# Rate limiting variables and LLM responder moved above the playground so UI
+# callbacks can call it during the same Streamlit run.
+LAST_REQUEST_TIME = 0
+MIN_REQUEST_INTERVAL = 1.2  # seconds
+
+@lru_cache(maxsize=100)
+def generate_response(prompt: str, conversation_history: tuple, skip_style: bool = False):
+    global LAST_REQUEST_TIME
+
+    current_time = time.time()
+    if current_time - LAST_REQUEST_TIME < MIN_REQUEST_INTERVAL:
+        time.sleep(MIN_REQUEST_INTERVAL - (current_time - LAST_REQUEST_TIME))
+    LAST_REQUEST_TIME = time.time()
+
+    retries = 3
+    backoff = 1
+    # If we're explicitly in OFFLINE_MODE, return a friendly message immediately.
+    if st.session_state.get('OFFLINE_MODE', False):
+        return "(OFFLINE MODE) The Dragon's LLM is currently unavailable — responses are disabled while offline."
+
+    # Compose the prompt. For code-generation flows we may skip the
+    # stylized system prompt to avoid adding narrative text into code.
+    if skip_style:
+        full_prompt = f"Current conversation:\n"
+    else:
+        full_prompt = f"{your_style_prompt}\n\nCurrent conversation:\n"
+
+    for role, content in conversation_history:
+        full_prompt += f"{role}: {content}\n"
+    full_prompt += f"assistant: "
+
+    for _ in range(retries):
+        # First, try Google Generative AI if it's available
+        if genai_available:
+            try:
+                try:
+                    from google.generativeai import GenerativeModel
+                except Exception as e:
+                    # Fall through to Groq if the import fails
+                    raise
+
+                model = GenerativeModel("gemini-2.0-flash")
+                response = model.generate_content(full_prompt)
+                return getattr(response, 'text', str(response))
+            except Exception as e:
+                # If Google fails for any reason, attempt Groq/OpenAI-compatible fallback
+                groq_text = vibe_clients.call_groq(full_prompt, model="openai/gpt-oss-20b")
+                if groq_text:
+                    return groq_text
+
+                # If the error looks like rate limiting, back off and retry
+                if "RATE_LIMIT" in str(e) or "RATE_LIMIT_EXCEEDED" in str(e):
+                    time.sleep(backoff)
+                    backoff *= 2
+                    continue
+                # Otherwise return an informative error
+                return f"Dragon fire temporarily dimmed ⚡ Error: {str(e)} 🔥 Please try again when the flames reignite"
+
+        else:
+            # Google not available — try Groq/OpenAI-compatible client directly
+            try:
+                groq_text = vibe_clients.call_groq(full_prompt, model="openai/gpt-oss-20b")
+                if groq_text:
+                    return groq_text
+                else:
+                    # Nothing returned, wait and retry
+                    time.sleep(backoff)
+                    backoff *= 2
+                    continue
+            except Exception as e:
+                if "RATE_LIMIT" in str(e) or "RATE_LIMIT_EXCEEDED" in str(e):
+                    time.sleep(backoff)
+                    backoff *= 2
+                    continue
+                return f"Dragon fire temporarily dimmed ⚡ Error: {str(e)} 🔥 Please try again when the flames reignite"
+
+    return "The dragon's breath is too hot 🚦 Wait a little and try again ✨"
+
+
+# --- AI Code Playground (3-column split) ---
+st.markdown("""
+<h3 style="color:#ffa500; display:flex; align-items:center; margin-top:2rem; font-family: 'Cinzel Decorative', cursive;">🧪 AI Code Playground</h3>
+<p style="color:#ffd700;">Prompt the assistant to generate code, edit it in-place, run and preview the output, download or share a permalink.</p>
+""", unsafe_allow_html=True)
+
+# initialize playground session state
+if 'playground_prompt' not in st.session_state:
+    st.session_state.playground_prompt = ''
+if 'playground_code' not in st.session_state:
+    st.session_state.playground_code = ''
+if 'playground_lang' not in st.session_state:
+    st.session_state.playground_lang = 'html'
+
+# Load snippet from query param if present
+params = st.query_params
+if 'snippet' in params and params.get('snippet'):
+    sid = params.get('snippet')[0]
+    try:
+        snippet = vibe_utils.get_snippet(sid)
+        if snippet:
+            st.session_state.playground_code = snippet.get('code', '')
+            st.session_state.playground_lang = snippet.get('lang', 'html')
+            st.session_state.playground_prompt = snippet.get('prompt', '')
+    except Exception:
+        pass
+
+
+# Layout: Left - prompt/chat, Middle - editor, Right - preview
+left, mid, right = st.columns([2, 6, 5])
+
+with left:
+    st.markdown('### Prompt & Chat')
+    # show small chat history for context
+    if st.session_state.get('messages'):
+        for msg in st.session_state.messages[-6:]:
+            role = msg.get('role')
+            content = msg.get('content')
+            if role == 'user':
+                st.markdown(f"**You:** {content}")
+            else:
+                st.markdown(f"**Assistant:** {content}")
+
+    st.markdown('---')
+    st.text_input('Playground Prompt (press Generate to create code)', key='playground_prompt_input')
+    st.selectbox('Language', options=['html', 'javascript', 'python'], key='playground_lang')
+    gen_col1, gen_col2 = st.columns([2,1])
+    with gen_col1:
+        if st.button('Generate', key='playground_generate'):
+            prompt_text = st.session_state.get('playground_prompt_input', '').strip()
+            if prompt_text:
+                st.session_state.playground_prompt = prompt_text
+                # craft a language-aware instruction and explicitly pass language to the model
+                lang = st.session_state.get('playground_lang', 'html')
+                # Insist on code-only output and include the language in the instruction
+                if lang in ('html', 'javascript'):
+                    instruction = (
+                        f"You are given the task: {prompt_text}\n"
+                        f"REQUIREMENT: Return ONLY the fully working {lang.upper()} code (HTML/CSS/JS if needed). "
+                        "Do NOT include any explanation, headings, markdown, or code fences — only raw source code."
+                    )
+                elif lang == 'python':
+                    instruction = (
+                        f"You are given the task: {prompt_text}\n"
+                        "REQUIREMENT: Return ONLY valid Python 3 code. "
+                        "Do NOT include any explanation, headings, markdown, or code fences — only raw source code."
+                    )
+                else:
+                    instruction = f"You are given the task: {prompt_text}\nReturn ONLY the requested source code for language: {lang}."
+
+                try:
+                    conv = tuple((m['role'], m['content']) for m in st.session_state.get('messages', []))
+                    gen = generate_response(instruction, conv, skip_style=True)
+                    import re, json
+
+                    # Delegate processing of the generator output (sanitization + deterministic fallback)
+                    try:
+                        sanitized = vibe_utils.process_generated_code(gen, prompt_text, lang=lang)
+                    except Exception:
+                        sanitized = ''
+
+                    # If we have sanitized code (either from LLM or fallback), persist and optionally run it
+                    if sanitized:
+                        st.session_state.playground_code = sanitized
+                        # Also update the textarea value so the editor reflects generated code immediately
+                        try:
+                            st.session_state['playground_textarea'] = sanitized
+                        except Exception:
+                            st.session_state.playground_textarea = sanitized
+                        # If language is python, run immediately and cache result for preview
+                        if lang == 'python':
+                            try:
+                                res = _run_code_safely(sanitized, lang='python', timeout=8)
+                                st.session_state['playground_last_result'] = res
+                                st.session_state['_preview_refresh'] = st.session_state.get('_preview_refresh', 0) + 1
+                            except Exception as e:
+                                st.session_state['playground_last_result'] = {"success": False, "stdout": "", "stderr": str(e)}
+                except Exception as e:
+                    st.error(f"Failed to generate code: {e}")
+    with gen_col2:
+        if st.button('Save Permalink', key='playground_save'):
+            code_text = st.session_state.get('playground_code', '')
+            lang = st.session_state.get('playground_lang', 'html')
+            prompt_text = st.session_state.get('playground_prompt', '')
+            sid = vibe_utils.save_snippet(code_text, lang=lang, prompt=prompt_text)
+            # set query param (new Streamlit API)
+            st.set_query_params(snippet=sid)
+            st.success(f'Permalink saved — snippet id: {sid}')
+            st.write(f"Shareable URL: ?snippet={sid} (copy your browser address bar to share)")
+
+    st.markdown('---')
+    st.markdown('Tip: After generation edit the code in the center editor. Use Run to refresh preview on the right.')
+
+with mid:
+    st.markdown('### Editor')
+    # Editor: try monaco component, fallback to textarea
+    # Use a single Streamlit textarea editor to avoid component-loading issues.
+    # Initialize the session state key for the textarea before creating the widget
+    # to avoid Streamlit warning about setting a widget both via default value and
+    # via the Session State API.
+    if 'playground_textarea' not in st.session_state:
+        st.session_state['playground_textarea'] = st.session_state.get('playground_code', '')
+
+    # If possible, embed a lightweight Monaco editor (CDN) so generated code
+    # appears with syntax highlighting. This is a one-way sync (Python -> iframe).
+    try:
+        code_initial = st.session_state.get('playground_textarea', '') or ''
+        lang = st.session_state.get('playground_lang', 'python')
+        # Escape closing script tags and HTML-sensitive characters
+        def _escape_html(s: str) -> str:
+            return (s.replace('&', '&amp;').replace('<', '&lt;').replace('>', '&gt;')
+                        .replace('\u2028', '\\u2028').replace('\u2029', '\\u2029'))
+
+        escaped = _escape_html(code_initial)
+
+        monaco_html = f"""
+        <!doctype html>
+        <html>
+        <head>
+          <meta charset="utf-8" />
+          <meta name="viewport" content="width=device-width, initial-scale=1.0">
+          <style>
+            html, body, #editor {{ height: 100%; margin: 0; padding: 0; background: #0b0b0f; }}
+            .monaco-editor .margin, .monaco-editor .monaco-editor-background {{ background: #0b0b0f; }}
+          </style>
+        </head>
+        <body>
+        <div id="editor" style="height:100%; width:100%;"></div>
+        <script src="https://unpkg.com/monaco-editor@0.39.0/min/vs/loader.js"></script>
+        <script>
+        require.config({{ paths: {{ 'vs': 'https://unpkg.com/monaco-editor@0.39.0/min/vs' }} }});
+        require(['vs/editor/editor.main'], function() {{
+            var editor = monaco.editor.create(document.getElementById('editor'), {{
+                value: `{escaped}`,
+                language: '{'javascript' if lang=='javascript' else ('html' if lang=='html' else 'python')}',
+                theme: 'vs-dark',
+                automaticLayout: true,
+                minimap: {{ enabled: false }}
+            }});
+            // Expose a function to set the editor value from outside (useful when rerendered)
+            window.setEditorValue = function(val) {{ editor.setValue(val); }};
+        }});
+        </script>
+        </body>
+        </html>
+        """
+
+        components.html(monaco_html, height=520, scrolling=True)
+        # Keep playground_code mirrored to the session state for execution/download
+        st.session_state.playground_code = st.session_state.get('playground_textarea', '')
+    except Exception:
+        # Fallback: simple textarea bound to session state
+        ta = st.text_area('Code Editor', height=520, key='playground_textarea')
+        st.session_state.playground_code = st.session_state.get('playground_textarea', '')
+
+    run_col1, run_col2, run_col3 = st.columns([1,1,1])
+    with run_col1:
+        if st.button('Run', key='playground_run'):
+            st.session_state['_preview_refresh'] = st.session_state.get('_preview_refresh', 0) + 1
+    with run_col2:
+        code_to_download = st.session_state.get('playground_code', '')
+        lang = st.session_state.get('playground_lang', 'txt')
+        filename = f"snippet.{ 'html' if lang=='html' else ('js' if lang=='javascript' else ('py' if lang=='python' else 'txt')) }"
+        st.download_button('Download', data=code_to_download, file_name=filename)
+    with run_col3:
+        if st.button('Clear', key='playground_clear'):
+            st.session_state.playground_code = ''
+
+with right:
+    st.markdown('### Live Preview')
+    lang = st.session_state.get('playground_lang', 'html')
+    code = st.session_state.get('playground_code', '')
+    preview_refresh = st.session_state.get('_preview_refresh', 0)
+
+    if lang in ('html', 'javascript'):
+        # Wrap JS inside a simple HTML shell when needed
+        if lang == 'javascript':
+            html_wrapper = f"""
+            <!doctype html>
+            <html>
+            <head>
+              <meta charset="utf-8">
+              <meta name="viewport" content="width=device-width, initial-scale=1">
+              <style>body{{background:#0b0b0f; color:#ddd;}}</style>
+            </head>
+            <body>
+            <div id="preview-root"></div>
+            <script>
+            {code}
+            </script>
+            </body>
+            </html>
+            """
+            components.html(html_wrapper, height=520, scrolling=True)
+        else:
+            # HTML preview: include minimal style for dark theme
+            dark_html = f"<div style='background:#0b0b0f; color:#ddd; min-height:520px'>{code}</div>"
+            components.html(dark_html, height=520, scrolling=True)
+    elif lang == 'python':
+        st.markdown('Run the Python code; stdout/stderr will appear below')
+        if st.button('Execute Python (preview)', key='playground_exec') or preview_refresh:
+            # Prefer cached result from generation-run, otherwise execute now.
+            res = st.session_state.get('playground_last_result') if st.session_state.get('playground_last_result') else _run_code_safely(code, lang='python', timeout=8)
+            st.subheader('Stdout')
+            st.code(res.get('stdout', ''))
+            st.subheader('Stderr')
+            st.code(res.get('stderr', ''))
+    else:
+        st.markdown('No preview available for this language')
+
+
+
 # --- Dragon Tales Functions ---
 def submit_tale(title, content, author="Anonymous Dragon"):
     """Submit a new dragon tale to the collection"""
@@ -706,59 +1063,7 @@ for msg in st.session_state.messages:
                 content = content.replace(emoji_char, f'<span class="{"dragon-emoji" if emoji_char in ["🐉","🔥","🏮","✨","⚔️","🏆"] else "code-emoji"}">{emoji_char}</span>')
         st.markdown(content, unsafe_allow_html=True)
 
-# Rate limiting variables
-LAST_REQUEST_TIME = 0
-MIN_REQUEST_INTERVAL = 1.2  # seconds
 
-@lru_cache(maxsize=100)
-
-def generate_response(prompt: str, conversation_history: tuple):
-    global LAST_REQUEST_TIME
-
-    current_time = time.time()
-    if current_time - LAST_REQUEST_TIME < MIN_REQUEST_INTERVAL:
-        time.sleep(MIN_REQUEST_INTERVAL - (current_time - LAST_REQUEST_TIME))
-    LAST_REQUEST_TIME = time.time()
-
-    retries = 3
-    backoff = 1
-    # If we're offline (as set in session state) or the genai client isn't available,
-    # return a friendly offline message instead of attempting network calls.
-    if st.session_state.get('OFFLINE_MODE', False) or not genai_available:
-        return "(OFFLINE MODE) The Dragon's LLM is currently unavailable — responses are disabled while offline."
-
-    for _ in range(retries):
-        try:
-            # Import and instantiate the model lazily to avoid import-time errors
-            try:
-                from google.generativeai import GenerativeModel
-            except Exception as e:
-                return f"(LLM error) Could not import GenerativeModel: {str(e)}"
-
-            model = GenerativeModel("gemini-2.0-flash")
-
-            full_prompt = f"{your_style_prompt}\n\nCurrent conversation:\n"
-            for role, content in conversation_history:
-                full_prompt += f"{role}: {content}\n"
-            full_prompt += f"assistant: "
-
-            # Gemini expects content as a string or list of parts
-            response = model.generate_content(full_prompt)
-            return response.text
-
-        except Exception as e:
-            # If Gemini fails, try Groq/OpenAI-compatible fallback
-            groq_text = vibe_clients.call_groq(full_prompt, model="openai/gpt-oss-20b")
-            if groq_text:
-                return groq_text
-
-            if "RATE_LIMIT_EXCEEDED" in str(e):
-                time.sleep(backoff)
-                backoff *= 2
-            else:
-                return f"Dragon fire temporarily dimmed ⚡ Error: {str(e)} 🔥 Please try again when the flames reignite"
-
-    return "The dragon's breath is too hot 🚦 Wait 2 minutes before approaching again ✨"
 
 # Chat input
 if prompt := st.chat_input("Speak your question to the dragon...", key="chat_input"):
@@ -771,37 +1076,46 @@ if prompt := st.chat_input("Speak your question to the dragon...", key="chat_inp
     with st.spinner("Consulting the ancient dragon scrolls..."):
         # Generate response
         reply = generate_response(prompt, conversation_history)
-        
-        # Stream the response word by word with typing effect
-        response_container = st.empty()
-        full_response = ""
-        
-        # Split reply into words but preserve emojis adjacent to words
-        words = []
-        current_word = ""
-        for char in reply:
-            if char.isspace():
-                if current_word:
-                    words.append(current_word)
-                    current_word = ""
-                words.append(char)
-            else:
-                current_word += char
-        if current_word:
-            words.append(current_word)
-        
-        # Display words one by one
-        for word in words:
-            full_response += word
-            time.sleep(0.05)  # Adjust speed as needed
-            
-            # Format the response with emoji effects
-            formatted_response = full_response
-            for emoji_char in ["🐉", "🔥", "💻", "🏮", "✨", "⚔️", "🔒", "🤖", "🏆"]:
-                if emoji_char in formatted_response:
-                    formatted_response = formatted_response.replace(emoji_char, f'<span class="{"dragon-emoji" if emoji_char in ["🐉","🔥","🏮","✨","⚔️","🏆"] else "code-emoji"}">{emoji_char}</span>')
-            
-            response_container.markdown(formatted_response, unsafe_allow_html=True)
+
+        # If the reply looks like an error message from the LLM, show the Dragon Spell card
+        if any(token in reply for token in ["(LLM error)", "Dragon fire temporarily dimmed", "OFFLINE MODE", "Error:"]):
+            st.markdown(f"""
+            <div style="border:2px dashed #ff8c00; padding:16px; border-radius:12px; background:linear-gradient(90deg,#2a0000,#120200); color:#ffd700;">
+                <h3>Dragon Spell Failed 🔥</h3>
+                <p style="color:#ffb366;">The dragon's incantation could not be completed.</p>
+                <pre style="color:#ffd700; background:#1a0500; padding:12px; border-radius:8px;">{reply}</pre>
+            </div>
+            """, unsafe_allow_html=True)
+        else:
+            # Stream the response word by word with typing effect
+            response_container = st.empty()
+            full_response = ""
+            # Split reply into words but preserve emojis adjacent to words
+            words = []
+            current_word = ""
+            for char in reply:
+                if char.isspace():
+                    if current_word:
+                        words.append(current_word)
+                        current_word = ""
+                    words.append(char)
+                else:
+                    current_word += char
+            if current_word:
+                words.append(current_word)
+
+            # Display words one by one
+            for word in words:
+                full_response += word
+                time.sleep(0.05)  # Adjust speed as needed
+
+                # Format the response with emoji effects
+                formatted_response = full_response
+                for emoji_char in ["🐉", "🔥", "💻", "🏮", "✨", "⚔️", "🔒", "🤖", "🏆"]:
+                    if emoji_char in formatted_response:
+                        formatted_response = formatted_response.replace(emoji_char, f'<span class="{"dragon-emoji" if emoji_char in ["🐉","🔥","🏮","✨","⚔️","🏆"] else "code-emoji"}">{emoji_char}</span>')
+
+                response_container.markdown(formatted_response, unsafe_allow_html=True)
 
     st.session_state.messages.append({"role": "assistant", "content": reply})
 

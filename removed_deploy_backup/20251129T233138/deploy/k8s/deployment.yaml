@@ -1,0 +1,32 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: dragon
+  labels:
+    app: dragon
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: dragon
+  template:
+    metadata:
+      labels:
+        app: dragon
+    spec:
+      containers:
+        - name: dragon
+          image: "${ECR_IMAGE}:${IMAGE_TAG}"
+          imagePullPolicy: IfNotPresent
+          ports:
+            - containerPort: 8501
+          envFrom:
+            - secretRef:
+                name: dragon-secrets
+          resources:
+            limits:
+              cpu: "500m"
+              memory: "512Mi"
+            requests:
+              cpu: "250m"
+              memory: "256Mi"

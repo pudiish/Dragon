@@ -1,3 +1,56 @@
+/.env
+/.streamlit/secrets.toml
+*.db
+/myenv
+/.venv
+temp_audio.mp3
+
+# Ignore persisted local config and health files
+/.config/dragon/
+/.offline_state.json
+/.health_status.json
+
+# macOS
+.DS_Store
+
+# IDE
+.idea/
+.vscode/
+
+# Logs
+streamlit.log
+*.log
+
+# Python caches
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Byte-compiled / optimized / DLL files
+*.pyc
+*.pyo
+*.pyd
+
+# Distribution / packaging
+build/
+dist/
+eggs/
+*.egg-info/
+
+# Node
+node_modules/
+npm-debug.log*
+package-lock.json
+
+# Model/cache directories
+model_cache/
+vibe/model_cache/
+
+# Static assets moved to assets/
+dragon.lottie
+
+# Local test files
+groq_test.mjs
 .env
 .streamlit/secrets.toml
 *.db
