@@ -60,29 +60,6 @@ def load_snippets() -> dict:
         return {}
 
 
-def save_snippet(code: str, lang: str = "text", prompt: str | None = None) -> str:
-    """Save a snippet and return its generated id."""
-    snippets = load_snippets()
-    sid = uuid.uuid4().hex[:12]
-    snippets[sid] = {
-        "code": code,
-        "lang": lang,
-        "prompt": prompt or "",
-        "created_at": now_utc().isoformat()
-    }
-    try:
-        snippets_file().write_text(json.dumps(snippets))
-    except Exception:
-        pass
-    return sid
-
-
-def get_snippet(sid: str) -> dict | None:
-    try:
-        return load_snippets().get(sid)
-    except Exception:
-        return None
-
 
 def sanitize_and_validate_code(code: str, lang: str = 'python') -> str:
     """Sanitize generated text and try to return valid code.
@@ -193,40 +170,4 @@ def sanitize_and_validate_code(code: str, lang: str = 'python') -> str:
     return code
 
 
-def process_generated_code(gen_output: str, prompt_text: str, lang: str = 'python') -> str:
-    """Given raw generator output and the original prompt/language, return sanitized code or a deterministic fallback.
 
-    This centralizes the logic used by the app when handling LLM output so tests
-    can exercise the same behavior.
-    """
-    import re, json
-
-    if gen_output is None:
-        gen_output = ''
-
-    # Strip common markdown fences if present
-    m = re.search(r"```(?:\w+)?\n([\s\S]*?)\n```", str(gen_output))
-    if m:
-        code_text = m.group(1)
-    else:
-        code_text = str(gen_output)
-
-    sanitized = sanitize_and_validate_code(code_text, lang=lang)
-
-    if sanitized:
-        return sanitized
-
-    # Deterministic fallback heuristics
-    p = (prompt_text or '').lower()
-    fallback_code = ''
-    if 'print' in p and 'hello' in p:
-        pm = re.search(r"print\s+['\"]?([a-z0-9 ,!_\-]+)['\"]?", p)
-        if pm:
-            content = pm.group(1).strip()
-        else:
-            content = 'hello world'
-        fallback_code = f'print({json.dumps(content)})'
-    elif 'hello' in p:
-        fallback_code = 'print("hello world")'
-
-    return fallback_code

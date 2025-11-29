@@ -1,0 +1,18 @@
+```python
+import streamlit as st
+from vibe.monaco_component import monaco_editor
+
+st.title('Monaco Editor Demo')
+
+initial = st.session_state.get('code', "# Write Python code here\nprint('hello world')\n")
+
+value = monaco_editor(value=initial, key='monaco1', height=400)
+
+if value is not None:
+    st.session_state['code'] = value
+    st.subheader('Editor contents')
+    st.code(value, language='python')
+else:
+    st.info('Monaco editor build not found — using textarea fallback.')
+
+```
